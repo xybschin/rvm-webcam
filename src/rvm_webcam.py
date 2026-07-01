@@ -95,16 +95,20 @@ DEFAULTS = {
 def main(model_path, backbone, input_device, output_device, width, height, fps,
          downsample_ratio, bg_color, bg_image, precision, use_compile, preview, on_demand):
     cfg = {}
-    config_path = Path.home() / ".config" / "rvm-webcam" / "config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            cfg = json.load(f)
+    for config_path in [
+        Path.home() / ".config" / "rvm-webcam" / "config.json",
+        Path("/etc/rvm-webcam/config.json"),
+    ]:
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            break
 
     model_path = model_path or cfg.get("model_path")
     if model_path is None:
         raise click.UsageError(
             "--model-path is required. Pass it directly or create "
-            f"{Path.home() / '.config' / 'rvm-webcam' / 'config.json'} "
+            "~/.config/rvm-webcam/config.json or /etc/rvm-webcam/config.json "
             'with {"model_path": "/path/to/model.pth"}'
         )
 

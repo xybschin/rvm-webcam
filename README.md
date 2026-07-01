@@ -1,90 +1,42 @@
 # rvm-webcam
 
-Real-time background removal virtual camera powered by [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting) (RVM). Captures your webcam feed, removes the background frame-by-frame using a deep neural network on GPU (or CPU fallback), composites a solid-color or image background, and outputs to a [v4l2loopback](https://github.com/umlaeute/v4l2loopback) virtual camera device.
-
-Accepts a pre-trained `.pth` checkpoint (MobiNetV3 or ResNet50 backbone) and exposes a virtual `/dev/videoN` device that any app (Zoom, OBS, browser) can consume.
-
-## Pipeline
-
-```
-┌────────────┐   ┌──────────┐   ┌─────────────┐   ┌───────────┐   ┌───────────────┐
-│  Webcam    │ → │ BGR→RGB  │ → │  RVM Model  │ → │ Composite │ → │ pyvirtualcam  │
-│ /dev/video0│   │  + Norm  │   │  (GPU/CPU)  │   │  fgr*pha  │   │ /dev/video10  │
-└────────────┘   └──────────┘   │  fgr + pha  │   │  + bg*(1- │   └───────────────┘
-                                └─────────────┘   │   pha)    │
-                                                  └───────────┘
-```
-
-1. **Capture** — OpenCV reads raw BGR frames from a physical webcam (`/dev/video0`). MJPG codec reduces USB bandwidth at high resolutions.
-2. **Preprocess** — Frame is converted BGR→RGB, normalized to `[0,1]`, reshaped to `(1, 3, H, W)` tensor, and moved to the target device/dtype.
-3. **Inference** — RVM runs in `torch.no_grad()`, optionally with `autocast` fp16 on CUDA. The model outputs a foreground image (`fgr`) and an alpha matte (`pha`). A 4-element recurrent state buffer (`rec`) enables temporal consistency across frames.
-4. **Composite** — Foreground is blended over a configurable background: `com = fgr * pha + bg * (1 - pha)`. The background is either a solid color or a JPEG/PNG image resized to the frame dimensions.
-5. **Output** — The composite is clamped, converted RGB→RGBA, sent to `pyvirtualcam` (writes to the v4l2loopback device), and the loop sleeps until the next frame interval.
-
-Downstream apps see the virtual camera as a normal `/dev/video10` with the background already removed.
+Real-time background removal virtual camera using [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting). Captures webcam, removes background via GPU (or CPU), composites a color/image background, outputs to a v4l2loopback device.
 
 ## Usage
 
 ### Prerequisites
 
-1. **Load the v4l2loopback module** on the host (creates `/dev/video10`) — see
-   [v4l2loopback setup](#v4l2loopback-host-requirement) below.
-2. **Download a model checkpoint** (weights are not committed to this repo):
+1. Load v4l2loopback — see [v4l2loopback setup](#v4l2loopback-setup) below.
+2. Download a model checkpoint:
    ```sh
-   mkdir -p models
    curl -fL -o models/rvm_mobilenetv3.pth \
      https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth
-   # optional, higher quality:
-   curl -fL -o models/rvm_resnet50.pth \
-     https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50.pth
    ```
-3. **Enter the dev shell** for dependencies (torch, opencv, pyvirtualcam):
-   ```sh
-   nix develop
-   ```
+3. Enter dev shell: `nix develop`
 
 ### Run
 
-Run the script directly with `python`:
-
 ```sh
-# solid-color background (default: green)
-python src/rvm_webcam.py \
-  --model-path models/rvm_mobilenetv3.pth \
-  --backbone mobilenetv3 \
-  --input-device /dev/video0 \
-  --output-device /dev/video10 \
-  --width 1280 --height 720 --fps 30 \
-  --downsample-ratio 0.25 \
-  --bg-color "0,255,0" \
-  --precision auto
-
-# image background
-python src/rvm_webcam.py \
-  --model-path models/rvm_mobilenetv3.pth \
-  --bg-image /path/to/background.jpg
-
-# ResNet50 backbone (higher quality, slower)
-python src/rvm_webcam.py \
-  --model-path models/rvm_resnet50.pth \
-  --backbone resnet50
-
-# preview via ffplay — no display server needed; logs go to stderr
-python src/rvm_webcam.py \
-  --model-path models/rvm_mobilenetv3.pth \
-  --preview | ffplay -f rawvideo -pixel_format rgb24 -video_size 1280x720 -i -
+nix run .# --impure -- --model-path models/rvm_mobilenetv3.pth
 ```
 
-Only `--model-path` is required; all other flags fall back to the defaults listed below.
-Press `Ctrl-C` to shut down cleanly (releases the camera and virtual device).
+Or build once and run anytime:
 
-> **First run** fetches the RVM model architecture from GitHub via `torch.hub` (needs `git`
-> and internet; the local `.pth` supplies the weights). If you hit GitHub API rate limits,
-> export a token: `export GITHUB_TOKEN=<your-token>`. Subsequent runs use the
-> `~/.cache/torch/hub/` cache.
+```sh
+nix build . --impure
+./result/bin/rvm-webcam --model-path models/rvm_mobilenetv3.pth
+```
 
-Alternatively, `nix build` produces an `rvm-webcam` wrapper you can run in place of
-`python src/rvm_webcam.py` (see [Setup](#setup-nix-flake)).
+Only `--model-path` is required; all other flags have defaults. Press `Ctrl-C` to clean up.
+
+> First run fetches the RVM architecture via `torch.hub` (needs `git` + internet). Subsequent runs use `~/.cache/torch/hub/`.
+
+Preview to ffplay (no display server needed):
+
+```sh
+nix run .# --impure -- --model-path models/rvm_mobilenetv3.pth --preview \
+  | ffplay -f rawvideo -pixel_format rgb24 -video_size 1280x720 -i -
+```
 
 ### Options
 
@@ -92,59 +44,24 @@ Alternatively, `nix build` produces an `rvm-webcam` wrapper you can run in place
 |------|---------|-------------|
 | `--model-path` | (required) | Path to `.pth` checkpoint |
 | `--backbone` | `mobilenetv3` | `mobilenetv3` or `resnet50` |
-| `--input-device` | `/dev/video0` | Physical webcam device |
+| `--input-device` | `/dev/video0` | Physical webcam |
 | `--output-device` | `/dev/video10` | v4l2loopback virtual device |
 | `--width` | `1280` | Frame width |
 | `--height` | `720` | Frame height |
 | `--fps` | `30` | Target framerate |
-| `--downsample-ratio` | `0.25` | Inference resolution fraction (lower = faster, less edge detail) |
-| `--bg-color` | `0,255,0` | Composited background as `R,G,B` (mutually exclusive with `--bg-image`) |
-| `--bg-image` | — | Path to a background image (JPG, PNG, etc.); resized to frame dimensions (mutually exclusive with `--bg-color`) |
-| `--compile` | off | Apply `torch.compile` (PyTorch ≥ 2.0, gains ~10-30% on CUDA). Falls back gracefully if Triton is unavailable. |
-| `--precision` | `auto` | `auto` (fp16 on CUDA, fp32 on CPU), `fp16`, or `fp32` |
-| `--preview` | off | Pipe raw RGB24 frames to stdout for ffplay (e.g. `--preview \| ffplay ...`); all logging goes to stderr. |
-| `--on-demand` | off | Only open webcam when a consumer opens `/dev/video10`. Sends black frames during idle. Useful for systemd service (see below). |
+| `--downsample-ratio` | `0.25` | Inference resolution fraction (lower = faster) |
+| `--bg-color` | `0,255,0` | Background as `R,G,B` (mutually exclusive with `--bg-image`) |
+| `--bg-image` | — | Background image path (JPG/PNG) |
+| `--compile` | off | `torch.compile` (PyTorch ≥ 2.0, ~10-30% on CUDA) |
+| `--precision` | `auto` | `auto`, `fp16`, or `fp32` |
+| `--preview` | off | Pipe raw RGB24 to stdout for ffplay |
+| `--on-demand` | off | Only open webcam when a consumer reads `/dev/video10` |
 
-## Setup (Nix Flake)
+All options can also be set in `~/.config/rvm-webcam/config.json` (underscores, not hyphens). CLI flags override config.
 
-The project provides a Nix flake pinned to `nixos-25.11` with CUDA-enabled `torch-bin`
-(CUDA 12.8), `torchvision-bin`, `opencv`, `pyvirtualcam`, and Python tooling. The prebuilt
-CUDA binaries are served from `cache.nixos-cuda.org`, so no local compilation is required.
+## v4l2loopback setup
 
-```sh
-# Enter dev shell with all dependencies
-nix develop
-
-# Build the CLI package (wraps python + deps into a single script)
-nix build
-```
-
-The `--impure` flag is needed because the built package accesses the host NVIDIA driver
-(`/run/opengl-driver/lib`) at runtime. You can also run directly without entering the dev shell:
-
-```sh
-# run directly (builds on first call)
-nix run .# --impure -- --model-path models/rvm_mobilenetv3.pth
-
-# or build once and run anytime
-nix build . --impure
-./result/bin/rvm-webcam --model-path models/rvm_mobilenetv3.pth
-
-# pipe preview to ffplay
-nix run .# --impure -- --model-path models/rvm_mobilenetv3.pth --preview \
-  | ffplay -f rawvideo -pixel_format rgb24 -video_size 1280x720 -i -
-```
-
-The `devShell` includes Neovim with pylsp/ruff formatting, `ffmpeg`, `v4l-utils`, and `git`
-(needed by `torch.hub` to fetch the RVM backbone at first run).
-
-### v4l2loopback (host requirement)
-
-The virtual camera device is provided by the [v4l2loopback](https://github.com/umlaeute/v4l2loopback)
-kernel module, which **cannot** be supplied by a dev shell — kernel modules are loaded on the
-host. Set it up out-of-band:
-
-- **NixOS:** add to your system config, then rebuild:
+- **NixOS:** add to system config:
   ```nix
   boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
   boot.kernelModules = [ "v4l2loopback" ];
@@ -152,73 +69,81 @@ host. Set it up out-of-band:
     options v4l2loopback devices=1 video_nr=10 card_label="rvm-webcam" exclusive_caps=1
   '';
   ```
-- **Other distros:** install the `v4l2loopback` package (or DKMS), then:
-  ```sh
-  sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="rvm-webcam" exclusive_caps=1
-  ```
+- **Other distros:** `sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="rvm-webcam" exclusive_caps=1`
 
-This creates `/dev/video10`, the default `--output-device`. Verify with `v4l2-ctl --list-devices`.
+Creates `/dev/video10`. Verify with `v4l2-ctl --list-devices`.
 
-GPU note: CUDA torch loads `libcuda.so` from the host NVIDIA driver
-(`/run/opengl-driver/lib` on NixOS). Both the dev shell and the built package prepend this
-path to `LD_LIBRARY_PATH` automatically. Falls back to CPU if no GPU is present.
+## systemd user service (standalone)
 
-### systemd user service (on-demand)
-
-`--on-demand` mode runs as a background daemon that only opens the webcam when a
-consumer (Zoom, Chrome, etc.) reads `/dev/video10`. The model stays loaded on GPU
-the whole time; the webcam shutter turns off between uses.
-
-**Build the service unit and install it:**
+Run as a background daemon that only captures webcam when a consumer is connected:
 
 ```sh
 nix build .#systemd-unit --impure
 mkdir -p ~/.config/systemd/user
 ln -s "$(realpath result/lib/systemd/user/rvm-webcam.service)" \
   ~/.config/systemd/user/rvm-webcam.service
+systemctl --user daemon-reload
+systemctl --user enable --now rvm-webcam
 ```
 
-**Create `~/.config/rvm-webcam/config.json` with your model path:**
-
+Create `~/.config/rvm-webcam/config.json`:
 ```json
 {
   "model_path": "/home/you/models/rvm_mobilenetv3.pth",
-  "backbone": "mobilenetv3",
   "width": 1280,
   "height": 720,
-  "fps": 30,
-  "downsample_ratio": 0.25
+  "fps": 30
 }
 ```
 
-Any flag from the [Options](#options) table can be set here (underscores, not hyphens).
-Values from `config.json` are overridden by explicit CLI flags.
+## NixOS flake integration
 
-Then enable and start the service:
+Add as a flake input and use the NixOS module:
 
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now rvm-webcam
-journalctl --user -u rvm-webcam -f
+```nix
+# flake.nix
+{
+  inputs.rvm-webcam.url = "github:xybschin/rvm-webcam";
+
+  outputs = { self, nixpkgs, rvm-webcam, ... }: {
+    nixosConfigurations.mybox = nixpkgs.lib.nixosSystem {
+      specialArgs = { inherit rvm-webcam; };
+      modules = [
+        rvm-webcam.nixosModules.default
+        ({ config, ... }: {
+          services.rvm-webcam = {
+            enable = true;
+            modelPath = "/home/you/models/rvm_mobilenetv3.pth";
+          };
+        })
+      ];
+    };
+  };
+}
 ```
 
-The service restarts on failure. Stop/disable with:
+This installs the binary, creates the systemd user service (runs with `--on-demand`), and generates `/etc/rvm-webcam/config.json` from the module options.
 
-```sh
-systemctl --user stop rvm-webcam
-systemctl --user disable rvm-webcam
-```
+Available options:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | — | Enable the service |
+| `modelPath` | string | — | Absolute path to `.pth` checkpoint |
+| `backbone` | `"mobilenetv3"` / `"resnet50"` | `"mobilenetv3"` | RVM backbone |
+| `width` | int | `1280` | Frame width |
+| `height` | int | `720` | Frame height |
+| `fps` | int | `30` | Target framerate |
+| `extraConfig` | attrset | `{}` | Additional config.json entries (e.g. `bg_color`, `precision`) |
+
+v4l2loopback must still be configured separately in your NixOS config (see [v4l2loopback setup](#v4l2loopback-setup)).
 
 ## Implementation
 
-The core pipeline is `src/rvm_webcam.py` (~265 lines). Key details:
+Single file `src/rvm_webcam.py` (~310 lines). Key details:
 
-- **`load_model()`** — Downloads the backbone from `PeterL1n/RobustVideoMatting` via `torch.hub`, loads the state dict.
-- **`open_capture()`** — Wraps `cv2.VideoCapture` with resolution, FPS, and MJPG fourcc.
-- **`_consumer_count()`** — Scans `/proc/*/fd/` to detect whether any process (other than ourself) has the output device open. Polled at 1 Hz in on-demand mode.
-- **On-demand loop** — When `--on-demand` is set and a consumer appears, opens the webcam and starts inference. After the last consumer disconnects, waits 2 seconds (debounce) then releases the webcam. Sends opaque black frames to the virtual device while idle so it remains visible to apps.
-- **`~/.config/rvm-webcam/config.json`** — Provides defaults for `--model-path`, `--backbone`, and other options. Used automatically when `--on-demand` is set.
-- **Signal handling** — `SIGINT`/`SIGTERM` gracefully tear down: releases the physical camera and closes the virtual device.
-- **Per-frame stats** — Logs average FPS every 100 frames.
-
-
+- **`load_model()`** — Fetches backbone via `torch.hub`, loads state dict.
+- **`open_capture()`** — `cv2.VideoCapture` with MJPG fourcc.
+- **`_consumer_count()`** — Scans `/proc/*/fd/` for processes holding the output device open.
+- **On-demand loop** — Lazy-opens webcam when a consumer appears; releases instantly when the last consumer disconnects. Sends black frames during idle.
+- **`config.json`** — Provides defaults for all CLI options. Precedence: CLI > config.json > built-in defaults.
