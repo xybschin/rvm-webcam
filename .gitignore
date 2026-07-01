@@ -37,3 +37,6 @@ result-*
 
 # Local overrides
 .env
+
+# Neovim project-local config
+.nvim.lua
