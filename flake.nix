@@ -100,16 +100,20 @@
           home.packages = [ self.packages.${pkgs.system}.default ];
 
           systemd.user.services.rvm-webcam = {
-            description = "rvm-webcam background removal virtual camera";
-            documentation = [ "https://github.com/bjarne/rvm-webcam" ];
-            after = [ "graphical-session.target" ];
-            wants = [ "graphical-session.target" ];
-            wantedBy = [ "default.target" ];
-            serviceConfig = {
+            Unit = {
+              Description = "rvm-webcam background removal virtual camera";
+              Documentation = "https://github.com/bjarne/rvm-webcam";
+              After = [ "graphical-session.target" ];
+              Wants = [ "graphical-session.target" ];
+            };
+            Service = {
               Type = "simple";
               ExecStart = "${self.packages.${pkgs.system}.default}/bin/rvm-webcam --on-demand";
               Restart = "on-failure";
               RestartSec = "3";
+            };
+            Install = {
+              WantedBy = [ "default.target" ];
             };
           };
 
