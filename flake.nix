@@ -71,6 +71,7 @@
             python-lsp-ruff
           ]
         );
+
       in
       {
         devShells.default = pkgs.mkShell {
@@ -108,6 +109,25 @@
           '';
         };
 
+        packages.systemd-unit = pkgs.runCommand "rvm-webcam-systemd-unit" { } ''
+          mkdir -p $out/lib/systemd/user
+          cat > $out/lib/systemd/user/rvm-webcam.service << EOF
+[Unit]
+Description=rvm-webcam background removal virtual camera
+Documentation=https://github.com/bjarne/rvm-webcam
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=${self.packages.${system}.default}/bin/rvm-webcam --on-demand
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+        '';
 
       }
     );

@@ -103,6 +103,7 @@ Alternatively, `nix build` produces an `rvm-webcam` wrapper you can run in place
 | `--compile` | off | Apply `torch.compile` (PyTorch ≥ 2.0, gains ~10-30% on CUDA). Falls back gracefully if Triton is unavailable. |
 | `--precision` | `auto` | `auto` (fp16 on CUDA, fp32 on CPU), `fp16`, or `fp32` |
 | `--preview` | off | Pipe raw RGB24 frames to stdout for ffplay (e.g. `--preview \| ffplay ...`); all logging goes to stderr. |
+| `--on-demand` | off | Only open webcam when a consumer opens `/dev/video10`. Sends black frames during idle. Useful for systemd service (see below). |
 
 ## Setup (Nix Flake)
 
@@ -162,11 +163,62 @@ GPU note: CUDA torch loads `libcuda.so` from the host NVIDIA driver
 (`/run/opengl-driver/lib` on NixOS). Both the dev shell and the built package prepend this
 path to `LD_LIBRARY_PATH` automatically. Falls back to CPU if no GPU is present.
 
+### systemd user service (on-demand)
+
+`--on-demand` mode runs as a background daemon that only opens the webcam when a
+consumer (Zoom, Chrome, etc.) reads `/dev/video10`. The model stays loaded on GPU
+the whole time; the webcam shutter turns off between uses.
+
+**Build the service unit and install it:**
+
+```sh
+nix build .#systemd-unit --impure
+mkdir -p ~/.config/systemd/user
+ln -s "$(realpath result/lib/systemd/user/rvm-webcam.service)" \
+  ~/.config/systemd/user/rvm-webcam.service
+```
+
+**Create `~/.config/rvm-webcam/config.json` with your model path:**
+
+```json
+{
+  "model_path": "/home/you/models/rvm_mobilenetv3.pth",
+  "backbone": "mobilenetv3",
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "downsample_ratio": 0.25
+}
+```
+
+Any flag from the [Options](#options) table can be set here (underscores, not hyphens).
+Values from `config.json` are overridden by explicit CLI flags.
+
+Then enable and start the service:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now rvm-webcam
+journalctl --user -u rvm-webcam -f
+```
+
+The service restarts on failure. Stop/disable with:
+
+```sh
+systemctl --user stop rvm-webcam
+systemctl --user disable rvm-webcam
+```
+
 ## Implementation
 
-The entire pipeline is a single file: `src/rvm_webcam.py` (~185 lines). Key details:
+The core pipeline is `src/rvm_webcam.py` (~265 lines). Key details:
 
 - **`load_model()`** — Downloads the backbone from `PeterL1n/RobustVideoMatting` via `torch.hub`, loads the state dict.
 - **`open_capture()`** — Wraps `cv2.VideoCapture` with resolution, FPS, and MJPG fourcc.
+- **`_consumer_count()`** — Scans `/proc/*/fd/` to detect whether any process (other than ourself) has the output device open. Polled at 1 Hz in on-demand mode.
+- **On-demand loop** — When `--on-demand` is set and a consumer appears, opens the webcam and starts inference. After the last consumer disconnects, waits 2 seconds (debounce) then releases the webcam. Sends opaque black frames to the virtual device while idle so it remains visible to apps.
+- **`~/.config/rvm-webcam/config.json`** — Provides defaults for `--model-path`, `--backbone`, and other options. Used automatically when `--on-demand` is set.
 - **Signal handling** — `SIGINT`/`SIGTERM` gracefully tear down: releases the physical camera and closes the virtual device.
 - **Per-frame stats** — Logs average FPS every 100 frames.
+
+

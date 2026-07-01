@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """rvm-webcam: real-time background removal virtual camera using RobustVideoMatting."""
 
+import json
+import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 import click
 import cv2
+import numpy as np
 import torch
 
 
@@ -35,22 +39,92 @@ def open_capture(device: str, width: int, height: int, fps: int) -> cv2.VideoCap
     return cap
 
 
+def _consumer_count(output_device: str) -> int:
+    our_pid = os.getpid()
+    count = 0
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == our_pid:
+                continue
+            try:
+                fd_dir = f"/proc/{entry}/fd"
+                for fd_entry in os.listdir(fd_dir):
+                    try:
+                        link = os.readlink(f"{fd_dir}/{fd_entry}")
+                        if link == output_device:
+                            count += 1
+                    except OSError:
+                        pass
+            except (PermissionError, FileNotFoundError):
+                pass
+    except PermissionError:
+        pass
+    return count
+
+
+DEFAULTS = {
+    "backbone": "mobilenetv3",
+    "input_device": "/dev/video0",
+    "output_device": "/dev/video10",
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "downsample_ratio": 0.25,
+    "precision": "auto",
+}
+
+
 @click.command()
-@click.option("--model-path", required=True, type=click.Path(exists=True), help="Path to rvm_mobilenetv3.pth")
-@click.option("--backbone", default="mobilenetv3", type=click.Choice(["mobilenetv3", "resnet50"]))
-@click.option("--input-device", default="/dev/video0", help="Real webcam device")
-@click.option("--output-device", default="/dev/video10", help="v4l2loopback virtual device")
-@click.option("--width", default=1280, type=int)
-@click.option("--height", default=720, type=int)
-@click.option("--fps", default=30, type=int)
-@click.option("--downsample-ratio", default=0.25, type=float, help="Lower = faster, less edge detail")
+@click.option("--model-path", required=False, type=click.Path(exists=True), help="Path to rvm_mobilenetv3.pth (can also be set in config.json)")
+@click.option("--backbone", default=None, type=click.Choice(["mobilenetv3", "resnet50"]))
+@click.option("--input-device", default=None, help="Real webcam device")
+@click.option("--output-device", default=None, help="v4l2loopback virtual device")
+@click.option("--width", default=None, type=int)
+@click.option("--height", default=None, type=int)
+@click.option("--fps", default=None, type=int)
+@click.option("--downsample-ratio", default=None, type=float, help="Lower = faster, less edge detail")
 @click.option("--bg-color", default=None, help="R,G,B for composite background (mutually exclusive with --bg-image)")
 @click.option("--bg-image", default=None, type=click.Path(exists=True), help="Path to a background image, e.g. JPG/PNG (mutually exclusive with --bg-color)")
-@click.option("--precision", default="auto", type=click.Choice(["auto", "fp16", "fp32"]))
+@click.option("--precision", default=None, type=click.Choice(["auto", "fp16", "fp32"]))
 @click.option("--compile", "use_compile", is_flag=True, default=False, help="Apply torch.compile (requires PyTorch ≥ 2.0, gains ~10-30% on CUDA)")
 @click.option("--preview", is_flag=True, default=False, help="Write raw RGB24 frames to stdout for piping to ffplay (e.g. | ffplay ...). All logging goes to stderr.")
+@click.option("--on-demand", is_flag=True, default=False, help="Only capture webcam when a consumer reads /dev/video10")
 def main(model_path, backbone, input_device, output_device, width, height, fps,
-         downsample_ratio, bg_color, bg_image, precision, use_compile, preview):
+         downsample_ratio, bg_color, bg_image, precision, use_compile, preview, on_demand):
+    cfg = {}
+    config_path = Path.home() / ".config" / "rvm-webcam" / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+
+    model_path = model_path or cfg.get("model_path")
+    if model_path is None:
+        raise click.UsageError(
+            "--model-path is required. Pass it directly or create "
+            f"{Path.home() / '.config' / 'rvm-webcam' / 'config.json'} "
+            'with {"model_path": "/path/to/model.pth"}'
+        )
+
+    backbone = backbone or cfg.get("backbone") or DEFAULTS["backbone"]
+    input_device = input_device or cfg.get("input_device") or DEFAULTS["input_device"]
+    output_device = output_device or cfg.get("output_device") or DEFAULTS["output_device"]
+    width = width or cfg.get("width") or DEFAULTS["width"]
+    height = height or cfg.get("height") or DEFAULTS["height"]
+    fps = fps or cfg.get("fps") or DEFAULTS["fps"]
+    downsample_ratio = downsample_ratio or cfg.get("downsample_ratio") or DEFAULTS["downsample_ratio"]
+    bg_color = bg_color or cfg.get("bg_color")
+    bg_image = bg_image or cfg.get("bg_image")
+    precision = precision or cfg.get("precision") or DEFAULTS["precision"]
+    if not use_compile:
+        use_compile = cfg.get("compile", False)
+    if not preview:
+        preview = cfg.get("preview", False)
+    if not on_demand:
+        on_demand = cfg.get("on_demand", False)
+
     if bg_color and bg_image:
         raise click.UsageError("--bg-color and --bg-image are mutually exclusive.")
 
@@ -113,11 +187,22 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
         bg_tensor = torch.tensor([r / 255, g / 255, b / 255], device=device, dtype=dtype).view(3, 1, 1)
         click.echo(f"[rvm-webcam] using background color: {color_str}")
 
-    cap = open_capture(input_device, width, height, fps)
-
     import pyvirtualcam
     vcam = pyvirtualcam.Camera(width=width, height=height, fps=fps, device=output_device)
     click.echo(f"[rvm-webcam] virtual camera live on {output_device}")
+
+    if on_demand:
+        cap = None
+        wakelock = None
+        last_poll = 0.0
+        DEBOUNCE_SEC = 0.0
+        POLL_INTERVAL = 1.0
+        black_frame = np.zeros((height, width, 3), dtype=np.uint8)
+        click.echo(
+            f"[rvm-webcam] on-demand enabled: webcam opens when consumer reads {output_device}"
+        )
+    else:
+        cap = open_capture(input_device, width, height, fps)
 
     rec = [None] * 4
     running = True
@@ -136,6 +221,41 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
     try:
         with torch.no_grad():
             while running:
+                if on_demand:
+                    now = time.monotonic()
+                    if now - last_poll >= POLL_INTERVAL:
+                        last_poll = now
+                        consumers = _consumer_count(output_device)
+
+                        if consumers > 0:
+                            if cap is None:
+                                click.echo(
+                                    f"[rvm-webcam] {consumers} consumer(s) connected, opening webcam",
+                                    err=True,
+                                )
+                                cap = open_capture(input_device, width, height, fps)
+                                rec = [None] * 4
+                                frame_count = 0
+                            wakelock = None
+                        else:
+                            if cap is not None:
+                                if wakelock is None:
+                                    wakelock = now
+                                elif now - wakelock >= DEBOUNCE_SEC:
+                                    click.echo(
+                                        "[rvm-webcam] no consumers for 2s, releasing webcam",
+                                        err=True,
+                                    )
+                                    cap.release()
+                                    cap = None
+                                    wakelock = None
+                                    rec = [None] * 4
+
+                    if cap is None:
+                        vcam.send(black_frame)
+                        vcam.sleep_until_next_frame()
+                        continue
+
                 ret, frame = cap.read()
                 if not ret:
                     click.echo("[rvm-webcam] frame read failed, retrying...", err=True)
@@ -153,7 +273,11 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                         fgr, pha, *rec = model(src, *rec, downsample_ratio)
                     except Exception:
                         if use_compile:
-                            click.echo("[rvm-webcam] WARNING: torch.compile failed at runtime; falling back to uncompiled model", err=True)
+                            click.echo(
+                                "[rvm-webcam] WARNING: torch.compile failed at runtime; "
+                                "falling back to uncompiled model",
+                                err=True,
+                            )
                             model = original_model
                             use_compile = False
                             fgr, pha, *rec = model(src, *rec, downsample_ratio)
@@ -173,11 +297,12 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
 
                 vcam.sleep_until_next_frame()
 
-                if frame_count % 100 == 0:
+                if frame_count % 100 == 0 and frame_count > 0:
                     elapsed = time.time() - t_start
                     click.echo(f"[rvm-webcam] {frame_count / elapsed:.1f} fps avg")
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         vcam.close()
         click.echo("[rvm-webcam] released camera and virtual device, exiting.")
 
