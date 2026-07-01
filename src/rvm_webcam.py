@@ -233,7 +233,12 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                                     f"[rvm-webcam] {consumers} consumer(s) connected, opening webcam",
                                     err=True,
                                 )
-                                cap = open_capture(input_device, width, height, fps)
+                                try:
+                                    cap = open_capture(input_device, width, height, fps)
+                                except RuntimeError as e:
+                                    click.echo(f"[rvm-webcam] {e}, retrying...", err=True)
+                                    cap = None
+                                    continue
                                 rec = [None] * 4
                                 frame_count = 0
                             wakelock = None
