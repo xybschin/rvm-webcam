@@ -54,7 +54,7 @@
             documentation = [ "https://github.com/bjarne/rvm-webcam" ];
             after = [ "graphical-session.target" ];
             wants = [ "graphical-session.target" ];
-            wantedBy = [ "default.target" ];
+            wantedBy = [ "graphical-session.target" ];
             serviceConfig = {
               Type = "simple";
               ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/rvm-webcam --on-demand";
@@ -113,7 +113,7 @@
               RestartSec = "3";
             };
             Install = {
-              WantedBy = [ "default.target" ];
+              WantedBy = [ "graphical-session.target" ];
             };
           };
 
@@ -231,7 +231,7 @@ Restart=on-failure
 RestartSec=3
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 EOF
         '';
 
