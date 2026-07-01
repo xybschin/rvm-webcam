@@ -69,11 +69,10 @@ python src/rvm_webcam.py \
   --model-path models/rvm_resnet50.pth \
   --backbone resnet50
 
-# preview only — shows a window with an FPS counter; works even without
-# a v4l2loopback device (useful for testing the pipeline)
+# preview via ffplay — no display server needed; logs go to stderr
 python src/rvm_webcam.py \
   --model-path models/rvm_mobilenetv3.pth \
-  --preview
+  --preview | ffplay -f rawvideo -pixel_format rgb24 -video_size 1280x720 -i -
 ```
 
 Only `--model-path` is required; all other flags fall back to the defaults listed below.
@@ -101,8 +100,9 @@ Alternatively, `nix build` produces an `rvm-webcam` wrapper you can run in place
 | `--downsample-ratio` | `0.25` | Inference resolution fraction (lower = faster, less edge detail) |
 | `--bg-color` | `0,255,0` | Composited background as `R,G,B` (mutually exclusive with `--bg-image`) |
 | `--bg-image` | — | Path to a background image (JPG, PNG, etc.); resized to frame dimensions (mutually exclusive with `--bg-color`) |
+| `--compile` | off | Apply `torch.compile` (PyTorch ≥ 2.0, gains ~10-30% on CUDA). Falls back gracefully if Triton is unavailable. |
 | `--precision` | `auto` | `auto` (fp16 on CUDA, fp32 on CPU), `fp16`, or `fp32` |
-| `--preview` | off | Open a window showing the output with a live FPS counter (press `q`/ESC to quit). If the virtual-camera device is unavailable, the preview still runs. |
+| `--preview` | off | Pipe raw RGB24 frames to stdout for ffplay (e.g. `--preview \| ffplay ...`); all logging goes to stderr. |
 
 ## Setup (Nix Flake)
 
@@ -116,6 +116,22 @@ nix develop
 
 # Build the CLI package (wraps python + deps into a single script)
 nix build
+```
+
+The `--impure` flag is needed because the built package accesses the host NVIDIA driver
+(`/run/opengl-driver/lib`) at runtime. You can also run directly without entering the dev shell:
+
+```sh
+# run directly (builds on first call)
+nix run .# --impure -- --model-path models/rvm_mobilenetv3.pth
+
+# or build once and run anytime
+nix build . --impure
+./result/bin/rvm-webcam --model-path models/rvm_mobilenetv3.pth
+
+# pipe preview to ffplay
+nix run .# --impure -- --model-path models/rvm_mobilenetv3.pth --preview \
+  | ffplay -f rawvideo -pixel_format rgb24 -video_size 1280x720 -i -
 ```
 
 The `devShell` includes Neovim with pylsp/ruff formatting, `ffmpeg`, `v4l-utils`, and `git`
@@ -148,7 +164,7 @@ path to `LD_LIBRARY_PATH` automatically. Falls back to CPU if no GPU is present.
 
 ## Implementation
 
-The entire pipeline is a single file: `src/rvm_webcam.py` (~125 lines). Key details:
+The entire pipeline is a single file: `src/rvm_webcam.py` (~185 lines). Key details:
 
 - **`load_model()`** — Downloads the backbone from `PeterL1n/RobustVideoMatting` via `torch.hub`, loads the state dict.
 - **`open_capture()`** — Wraps `cv2.VideoCapture` with resolution, FPS, and MJPG fourcc.

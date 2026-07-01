@@ -47,11 +47,18 @@
           propagatedBuildInputs = [ pythonPackages.numpy ];
         };
 
+        opencv4-python = pythonPackages.toPythonModule (
+          pkgs.opencv4.override {
+            enablePython = true;
+            pythonPackages = pythonPackages;
+          }
+        );
+
         pythonEnv = pkgs.python312.withPackages (
           ps: with ps; [
             torch-bin
             torchvision-bin
-            opencv4
+            opencv4-python
             numpy
             pyvirtualcam
             click
@@ -75,6 +82,7 @@
             pkgs.neovim
             pkgs.ffmpeg
             pkgs.v4l-utils
+            pkgs.glibc # provides ldconfig needed by torch.compile (Triton)
             pkgs.git # torch.hub.load clones PeterL1n/RobustVideoMatting at runtime
           ];
 
@@ -94,14 +102,13 @@
             pkgs.git # torch.hub.load clones PeterL1n/RobustVideoMatting at runtime
           ];
           text = ''
-            # torch.hub caches the cloned RVM repo here; default ~/.cache/torch is fine
             export TORCH_HOME="''${TORCH_HOME:-''${XDG_CACHE_HOME:-$HOME/.cache}/torch}"
-            # libcuda.so ships with the host NVIDIA driver, not nixpkgs. On NixOS it lives
-            # at /run/opengl-driver/lib; prepend it so CUDA torch can find the driver.
             export LD_LIBRARY_PATH="/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             exec ${pythonEnv}/bin/python ${./src/rvm_webcam.py} "$@"
           '';
         };
+
+
       }
     );
 }

@@ -2,6 +2,7 @@
 """rvm-webcam: real-time background removal virtual camera using RobustVideoMatting."""
 
 import signal
+import sys
 import time
 
 import click
@@ -16,7 +17,7 @@ def load_model(model_path: str, backbone: str, device: str):
 
 
 def open_capture(device: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(device)
+    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open capture device {device}")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -47,11 +48,23 @@ def open_capture(device: str, width: int, height: int, fps: int) -> cv2.VideoCap
 @click.option("--bg-image", default=None, type=click.Path(exists=True), help="Path to a background image, e.g. JPG/PNG (mutually exclusive with --bg-color)")
 @click.option("--precision", default="auto", type=click.Choice(["auto", "fp16", "fp32"]))
 @click.option("--compile", "use_compile", is_flag=True, default=False, help="Apply torch.compile (requires PyTorch ≥ 2.0, gains ~10-30% on CUDA)")
-@click.option("--preview", is_flag=True, default=False, help="Open a window showing the output with a live FPS counter (press q/ESC to quit). Virtual camera is skipped if its device is unavailable.")
+@click.option("--preview", is_flag=True, default=False, help="Write raw RGB24 frames to stdout for piping to ffplay (e.g. | ffplay ...). All logging goes to stderr.")
 def main(model_path, backbone, input_device, output_device, width, height, fps,
          downsample_ratio, bg_color, bg_image, precision, use_compile, preview):
     if bg_color and bg_image:
         raise click.UsageError("--bg-color and --bg-image are mutually exclusive.")
+
+    if preview:
+        if sys.stdout.isatty():
+            click.echo(
+                "[rvm-webcam] ERROR: --preview requires piping stdout to ffplay, e.g.:\n"
+                f"  {sys.argv[0]} --model-path ... --preview | ffplay -f rawvideo "
+                f"-pixel_format rgb24 -video_size {width}x{height} -i -",
+                err=True,
+            )
+            raise SystemExit(1)
+        _real_stdout = sys.stdout
+        sys.stdout = sys.stderr
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if precision == "auto":
@@ -66,7 +79,9 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
     if use_compile:
         if not hasattr(torch, "compile"):
             click.echo("[rvm-webcam] WARNING: torch.compile not available (requires PyTorch >= 2.0), skipping.", err=True)
+            use_compile = False
         else:
+            original_model = model
             model = torch.compile(model, mode="reduce-overhead")
             click.echo("[rvm-webcam] torch.compile enabled (reduce-overhead)")
 
@@ -101,18 +116,8 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
     cap = open_capture(input_device, width, height, fps)
 
     import pyvirtualcam
-    try:
-        vcam = pyvirtualcam.Camera(width=width, height=height, fps=fps, device=output_device)
-        click.echo(f"[rvm-webcam] virtual camera live on {output_device}")
-    except Exception as exc:
-        if not preview:
-            raise
-        vcam = None
-        click.echo(
-            f"[rvm-webcam] WARNING: could not open virtual camera {output_device} ({exc}); "
-            "continuing with preview only.",
-            err=True,
-        )
+    vcam = pyvirtualcam.Camera(width=width, height=height, fps=fps, device=output_device)
+    click.echo(f"[rvm-webcam] virtual camera live on {output_device}")
 
     rec = [None] * 4
     running = True
@@ -125,13 +130,8 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    if preview:
-        click.echo("[rvm-webcam] preview window enabled (press q or ESC to quit)")
-
     frame_count = 0
     t_start = time.time()
-    fps_now = 0.0
-    t_last = t_start
 
     try:
         with torch.no_grad():
@@ -149,41 +149,36 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                 src = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype) / 255.0
 
                 with torch.autocast(device_type=device, dtype=dtype, enabled=(device == "cuda")):
-                    fgr, pha, *rec = model(src, *rec, downsample_ratio)
+                    try:
+                        fgr, pha, *rec = model(src, *rec, downsample_ratio)
+                    except Exception:
+                        if use_compile:
+                            click.echo("[rvm-webcam] WARNING: torch.compile failed at runtime; falling back to uncompiled model", err=True)
+                            model = original_model
+                            use_compile = False
+                            fgr, pha, *rec = model(src, *rec, downsample_ratio)
+                        else:
+                            raise
 
                 com = fgr * pha + bg_tensor * (1 - pha)
                 out = (com[0].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
 
-                if vcam is not None:
-                    vcam.send(out)
-
-                frame_count += 1
-                now = time.time()
-                fps_now = 1.0 / (now - t_last) if now > t_last else fps_now
-                t_last = now
+                vcam.send(out)
 
                 if preview:
-                    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-                    cv2.putText(
-                        bgr, f"{fps_now:.1f} FPS", (12, 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA,
-                    )
-                    cv2.imshow("rvm-webcam preview", bgr)
-                    if cv2.waitKey(1) & 0xFF in (ord("q"), 27):  # q or ESC
-                        running = False
+                    _real_stdout.buffer.write(out.tobytes())
+                    _real_stdout.buffer.flush()
 
-                if vcam is not None:
-                    vcam.sleep_until_next_frame()
+                frame_count += 1
+
+                vcam.sleep_until_next_frame()
 
                 if frame_count % 100 == 0:
-                    elapsed = now - t_start
+                    elapsed = time.time() - t_start
                     click.echo(f"[rvm-webcam] {frame_count / elapsed:.1f} fps avg")
     finally:
         cap.release()
-        if vcam is not None:
-            vcam.close()
-        if preview:
-            cv2.destroyAllWindows()
+        vcam.close()
         click.echo("[rvm-webcam] released camera and virtual device, exiting.")
 
 
