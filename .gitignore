@@ -1,0 +1,39 @@
+# Model checkpoints (large binaries; download separately)
+models/
+*.pth
+*.pt
+*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.Python
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Nix
+result
+result-*
+.direnv/
+
+# torch.hub cache (if ever placed in-tree)
+.cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local overrides
+.env
