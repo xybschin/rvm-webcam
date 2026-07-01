@@ -47,7 +47,7 @@
         };
 
         config = lib.mkIf config.services.rvm-webcam.enable {
-          environment.systemPackages = [ self.packages.${pkgs.system}.default ];
+          environment.systemPackages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
 
           systemd.user.services.rvm-webcam = {
             description = "rvm-webcam background removal virtual camera";
@@ -57,7 +57,7 @@
             wantedBy = [ "default.target" ];
             serviceConfig = {
               Type = "simple";
-              ExecStart = "${self.packages.${pkgs.system}.default}/bin/rvm-webcam --on-demand";
+              ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/rvm-webcam --on-demand";
               Restart = "on-failure";
               RestartSec = "3";
             };
@@ -97,7 +97,7 @@
         };
 
         config = lib.mkIf config.services.rvm-webcam.enable {
-          home.packages = [ self.packages.${pkgs.system}.default ];
+          home.packages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
 
           systemd.user.services.rvm-webcam = {
             Unit = {
@@ -108,7 +108,7 @@
             };
             Service = {
               Type = "simple";
-              ExecStart = "${self.packages.${pkgs.system}.default}/bin/rvm-webcam --on-demand";
+              ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/rvm-webcam --on-demand";
               Restart = "on-failure";
               RestartSec = "3";
             };
