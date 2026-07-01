@@ -74,6 +74,56 @@
           );
         };
       };
+      homeManagerModules.default = { config, pkgs, lib, ... }: {
+        options.services.rvm-webcam = {
+          enable = lib.mkEnableOption "rvm-webcam background removal virtual camera";
+          modelPath = lib.mkOption {
+            type = lib.types.str;
+            description = "Absolute path to the RVM model .pth file";
+          };
+          backbone = lib.mkOption {
+            type = lib.types.enum [ "mobilenetv3" "resnet50" ];
+            default = "mobilenetv3";
+            description = "RVM backbone architecture";
+          };
+          width = lib.mkOption { type = lib.types.int; default = 1280; };
+          height = lib.mkOption { type = lib.types.int; default = 720; };
+          fps = lib.mkOption { type = lib.types.int; default = 30; };
+          extraConfig = lib.mkOption {
+            type = lib.types.attrsOf lib.types.raw;
+            default = { };
+            description = "Additional config.json entries (e.g. bg_color, precision)";
+          };
+        };
+
+        config = lib.mkIf config.services.rvm-webcam.enable {
+          home.packages = [ self.packages.${pkgs.system}.default ];
+
+          systemd.user.services.rvm-webcam = {
+            description = "rvm-webcam background removal virtual camera";
+            documentation = [ "https://github.com/bjarne/rvm-webcam" ];
+            after = [ "graphical-session.target" ];
+            wants = [ "graphical-session.target" ];
+            wantedBy = [ "default.target" ];
+            serviceConfig = {
+              Type = "simple";
+              ExecStart = "${self.packages.${pkgs.system}.default}/bin/rvm-webcam --on-demand";
+              Restart = "on-failure";
+              RestartSec = "3";
+            };
+          };
+
+          xdg.configFile."rvm-webcam/config.json".text = builtins.toJSON (
+            {
+              model_path = config.services.rvm-webcam.modelPath;
+              backbone = config.services.rvm-webcam.backbone;
+              width = config.services.rvm-webcam.width;
+              height = config.services.rvm-webcam.height;
+              fps = config.services.rvm-webcam.fps;
+            } // config.services.rvm-webcam.extraConfig
+          );
+        };
+      };
     }
     // flake-utils.lib.eachSystem [ "x86_64-linux" ] (
       system:
