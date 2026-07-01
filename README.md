@@ -68,6 +68,12 @@ python src/rvm_webcam.py \
 python src/rvm_webcam.py \
   --model-path models/rvm_resnet50.pth \
   --backbone resnet50
+
+# preview only — shows a window with an FPS counter; works even without
+# a v4l2loopback device (useful for testing the pipeline)
+python src/rvm_webcam.py \
+  --model-path models/rvm_mobilenetv3.pth \
+  --preview
 ```
 
 Only `--model-path` is required; all other flags fall back to the defaults listed below.
@@ -96,6 +102,7 @@ Alternatively, `nix build` produces an `rvm-webcam` wrapper you can run in place
 | `--bg-color` | `0,255,0` | Composited background as `R,G,B` (mutually exclusive with `--bg-image`) |
 | `--bg-image` | — | Path to a background image (JPG, PNG, etc.); resized to frame dimensions (mutually exclusive with `--bg-color`) |
 | `--precision` | `auto` | `auto` (fp16 on CUDA, fp32 on CPU), `fp16`, or `fp32` |
+| `--preview` | off | Open a window showing the output with a live FPS counter (press `q`/ESC to quit). If the virtual-camera device is unavailable, the preview still runs. |
 
 ## Setup (Nix Flake)
 
