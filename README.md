@@ -4,12 +4,12 @@ Real-time background removal virtual camera using [RobustVideoMatting](https://g
 
 ## Prerequisites
 
-1. Load v4l2loopback — see [setup](#v4l2loopback-setup) below.
-2. Download a model checkpoint:
-   ```sh
-   curl -fL -o models/rvm_mobilenetv3.pth \
-     https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth
-   ```
+Load v4l2loopback ([setup below](#v4l2loopback-setup)) and download a model checkpoint:
+
+```sh
+curl -fL -o models/rvm_mobilenetv3.pth \
+  https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth
+```
 
 ## Usage
 

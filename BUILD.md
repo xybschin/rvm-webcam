@@ -69,13 +69,11 @@ This installs the binary, creates the systemd user service (runs with `--on-dema
 |--------|------|---------|-------------|
 | `enable` | bool | — | Enable the service |
 | `modelPath` | string | — | Absolute path to `.pth` checkpoint |
-| `backbone` | `"mobilenetv3"` / `"resnet50"` | `"mobilenetv3"` | RVM backbone |
-| `width` | int | `1280` | Frame width |
-| `height` | int | `720` | Frame height |
-| `fps` | int | `30` | Target framerate |
-| `extraConfig` | attrset | `{}` | Additional config.json entries |
+| `backbone` | `"mobilenetv3"` / `"resnet50"` | `"mobilenetv3"` | |
+| `width` / `height` / `fps` | int | `1280` / `720` / `30` | |
+| `extraConfig` | attrset | `{}` | Extra `config.json` entries (e.g. `bg_color`, `precision`) |
 
-v4l2loopback must still be configured separately in your NixOS config.
+v4l2loopback must still be configured separately (see README).
 
 ## Home-manager module
 
@@ -89,7 +87,7 @@ v4l2loopback must still be configured separately in your NixOS config.
 }
 ```
 
-Writes config to `~/.config/rvm-webcam/config.json` instead of `/etc/rvm-webcam/config.json`.
+Same options as the NixOS module, but writes config to `~/.config/rvm-webcam/config.json` instead of `/etc/rvm-webcam/config.json`.
 
 ## Implementation
 
