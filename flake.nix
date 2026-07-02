@@ -51,7 +51,7 @@
 
           systemd.user.services.rvm-webcam = {
             description = "rvm-webcam background removal virtual camera";
-            documentation = [ "https://github.com/bjarne/rvm-webcam" ];
+            documentation = [ "https://github.com/xybschin/rvm-webcam" ];
             after = [ "graphical-session.target" ];
             wants = [ "graphical-session.target" ];
             wantedBy = [ "graphical-session.target" ];
@@ -102,7 +102,7 @@
           systemd.user.services.rvm-webcam = {
             Unit = {
               Description = "rvm-webcam background removal virtual camera";
-              Documentation = "https://github.com/bjarne/rvm-webcam";
+              Documentation = "https://github.com/xybschin/rvm-webcam";
               After = [ "graphical-session.target" ];
               Wants = [ "graphical-session.target" ];
             };
@@ -220,7 +220,7 @@
           cat > $out/lib/systemd/user/rvm-webcam.service << EOF
 [Unit]
 Description=rvm-webcam background removal virtual camera
-Documentation=https://github.com/bjarne/rvm-webcam
+Documentation=https://github.com/xybschin/rvm-webcam
 After=graphical-session.target
 Wants=graphical-session.target
 
