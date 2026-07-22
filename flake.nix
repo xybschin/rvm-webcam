@@ -11,7 +11,7 @@
   };
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -135,6 +135,7 @@
           config = {
             allowUnfree = true;
             rocmSupport = true;
+            rocmTargets = [ "gfx1201" ];
           };
         };
 
@@ -195,9 +196,6 @@
           shellHook = ''
             export ROCM_PATH="${pkgs.rocmPackages.clr}"
             export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            # Override for GPUs not yet in this ROCm version's GPU list (e.g. RDNA 4 / gfx1201).
-            # Remove or change this if your GPU is fully supported.
-            export HSA_OVERRIDE_GFX_VERSION="12.0.1"
             echo "rvm-webcam dev shell: python=$(python --version), rocm available via torch.cuda.is_available()"
           '';
         };
@@ -215,7 +213,6 @@
             export TORCH_HOME="''${TORCH_HOME:-''${XDG_CACHE_HOME:-$HOME/.cache}/torch}"
             export ROCM_PATH="${pkgs.rocmPackages.clr}"
             export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            export HSA_OVERRIDE_GFX_VERSION="12.0.1"
             export CC=gcc
             exec ${pythonEnv}/bin/python ${./src/rvm_webcam.py} "$@"
           '';
