@@ -417,7 +417,7 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
     signal.signal(signal.SIGTERM, shutdown)
 
     frame_count = 0
-    t_start = time.time()
+    t_start = time.perf_counter_ns()
     # Stage timing accumulators (in nanoseconds).
     acc_h2d = 0
     acc_infer = 0
@@ -453,7 +453,7 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                                     continue
                                 rec = [None] * 4
                                 frame_count = 0
-                                t_start = time.time()
+                                t_start = time.perf_counter_ns()
                                 acc_h2d = acc_infer = acc_take = acc_d2h = acc_sleep = 0
                                 cur = 0
                                 prev_buf_idx = None
@@ -555,7 +555,7 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                     n = frame_count
                     ms = lambda ns: ns / 1e6
                     click.echo(
-                        f"[rvm-webcam] {frame_count / (t5 / 1e9):.1f} fps  "
+                        f"[rvm-webcam] {frame_count / ((t5 - t_start) / 1e9):.1f} fps  "
                         f"h2d={ms(acc_h2d/n):.1f}  "
                         f"infer={ms(acc_infer/n):.1f}  "
                         f"take={ms(acc_take/n):.1f}  "

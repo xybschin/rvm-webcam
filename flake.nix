@@ -208,6 +208,7 @@
             pythonEnv
             pkgs.v4l-utils
             pkgs.git
+            pkgs.gcc
             pkgs.rocmPackages.clr
           ];
           text = ''
@@ -215,6 +216,7 @@
             export ROCM_PATH="${pkgs.rocmPackages.clr}"
             export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export HSA_OVERRIDE_GFX_VERSION="12.0.1"
+            export CC=gcc
             exec ${pythonEnv}/bin/python ${./src/rvm_webcam.py} "$@"
           '';
         };
