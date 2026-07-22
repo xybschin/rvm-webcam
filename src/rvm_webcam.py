@@ -89,7 +89,7 @@ DEFAULTS = {
 @click.option("--bg-color", default=None, help="R,G,B for composite background (mutually exclusive with --bg-image)")
 @click.option("--bg-image", default=None, type=click.Path(exists=True), help="Path to a background image, e.g. JPG/PNG (mutually exclusive with --bg-color)")
 @click.option("--precision", default=None, type=click.Choice(["auto", "fp16", "fp32"]))
-@click.option("--compile", "use_compile", is_flag=True, default=False, help="Apply torch.compile (requires PyTorch ≥ 2.0, gains ~10-30% on CUDA)")
+@click.option("--compile", "use_compile", is_flag=True, default=False, help="Apply torch.compile (requires PyTorch ≥ 2.0, may improve GPU performance)")
 @click.option("--preview", is_flag=True, default=False, help="Write raw RGB24 frames to stdout for piping to ffplay (e.g. | ffplay ...). All logging goes to stderr.")
 @click.option("--on-demand", is_flag=True, default=False, help="Only capture webcam when a consumer reads /dev/video10")
 def main(model_path, backbone, input_device, output_device, width, height, fps,
@@ -145,12 +145,18 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
         sys.stdout = sys.stderr
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _is_rocm = (
+        torch.cuda.is_available()
+        and hasattr(torch.version, "hip")
+        and torch.version.hip is not None
+    )
     if precision == "auto":
         dtype = torch.float16 if device == "cuda" else torch.float32
     else:
         dtype = torch.float16 if precision == "fp16" else torch.float32
 
-    click.echo(f"[rvm-webcam] device={device} dtype={dtype} downsample_ratio={downsample_ratio}")
+    _backend = "rocm" if _is_rocm else device
+    click.echo(f"[rvm-webcam] device={_backend} dtype={dtype} downsample_ratio={downsample_ratio}")
 
     model = load_model(model_path, backbone, device)
 
@@ -161,7 +167,7 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
         else:
             original_model = model
             model = torch.compile(model, mode="reduce-overhead")
-            click.echo("[rvm-webcam] torch.compile enabled (reduce-overhead)")
+            click.echo("[rvm-webcam] torch.compile enabled")
 
     if bg_image:
         img = cv2.imread(bg_image)
@@ -277,7 +283,7 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 src = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype) / 255.0
 
-                with torch.autocast(device_type=device, dtype=dtype, enabled=(device == "cuda")):
+                with torch.autocast(device_type=device, dtype=dtype, enabled=(device != "cpu")):
                     try:
                         fgr, pha, *rec = model(src, *rec, downsample_ratio)
                     except Exception:

@@ -1,15 +1,16 @@
 # rvm-webcam
 
-Real-time background removal virtual camera using [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting). Captures webcam, removes background via GPU (or CPU), composites a color/image background, outputs to a v4l2loopback device.
+Real-time background removal virtual camera using [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting). Captures webcam, removes background via **AMD (ROCm)** or **NVIDIA (CUDA)** GPU (with CPU fallback), composites a color/image background, outputs to a v4l2loopback device.
 
 ## Prerequisites
 
-Load v4l2loopback ([setup below](#v4l2loopback-setup)) and download a model checkpoint:
-
-```sh
-curl -fL -o models/rvm_mobilenetv3.pth \
-  https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth
-```
+1. **AMD GPU** (GCN 4th gen / Polaris or newer) with ROCm-compatible driver, or **NVIDIA GPU** with CUDA driver, or CPU-only fallback.
+2. Load v4l2loopback ([setup below](#v4l2loopback-setup)).
+3. Download a model checkpoint:
+   ```sh
+   curl -fL -o models/rvm_mobilenetv3.pth \
+     https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth
+   ```
 
 ## Usage
 
@@ -42,7 +43,7 @@ nix run github:xybschin/rvm-webcam --impure -- --model-path models/rvm_mobilenet
 | `--downsample-ratio` | `0.25` | Inference resolution fraction (lower = faster) |
 | `--bg-color` | `0,255,0` | Background as `R,G,B` (mutually exclusive with `--bg-image`) |
 | `--bg-image` | — | Background image path (JPG/PNG) |
-| `--compile` | off | `torch.compile` (PyTorch ≥ 2.0, ~10-30% on CUDA) |
+| `--compile` | off | `torch.compile` (PyTorch ≥ 2.0, may improve GPU perf) |
 | `--precision` | `auto` | `auto`, `fp16`, or `fp32` |
 | `--preview` | off | Pipe raw RGB24 to stdout for ffplay |
 | `--on-demand` | off | Only open webcam when a consumer reads `/dev/video10` |

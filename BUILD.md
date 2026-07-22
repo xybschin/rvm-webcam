@@ -1,12 +1,14 @@
 # Building & Integration
 
+> **AMD GPU users (ROCm):** Building PyTorch from source with ROCm support takes a long time. Pre-built ROCm wheels are an alternative — use `--precision fp32` if `torch.compile` isn't stable on your ROCm version.
+
 ## Development shell
 
 ```sh
 nix develop --impure
 ```
 
-Installs Python with torch, torchvision, opencv, pyvirtualcam, plus dev tools (ruff, pyright, neovim).
+Installs Python with ROCm-enabled torch, torchvision, opencv, pyvirtualcam, plus dev tools (ruff, pyright, neovim).
 
 ## Build
 

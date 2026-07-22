@@ -4,11 +4,9 @@
   nixConfig = {
     extra-substituters = [
       "https://nix-community.cachix.org"
-      "https://cache.nixos-cuda.org"
     ];
     extra-trusted-public-keys = [
       "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
-      "cache.nixos-cuda.org:74DUi4Ye579gUqzH4ziL9IyiJBlDpMRn9MBN8oNan9M="
     ];
   };
 
@@ -136,7 +134,7 @@
           inherit system;
           config = {
             allowUnfree = true;
-            cudaSupport = true; # CUDA torch-bin is prebuilt on cache.nixos-cuda.org; false yields an uncached build
+            rocmSupport = true;
           };
         };
 
@@ -162,8 +160,8 @@
 
         pythonEnv = pkgs.python312.withPackages (
           ps: with ps; [
-            torch-bin
-            torchvision-bin
+            torch
+            torchvision
             opencv4-python
             numpy
             pyvirtualcam
@@ -189,15 +187,18 @@
             pkgs.neovim
             pkgs.ffmpeg
             pkgs.v4l-utils
-            pkgs.glibc # provides ldconfig needed by torch.compile (Triton)
-            pkgs.git # torch.hub.load clones PeterL1n/RobustVideoMatting at runtime
+            pkgs.glibc
+            pkgs.git
+            pkgs.rocmPackages.clr
           ];
 
-          # libcuda.so comes from the host NVIDIA driver (/run/opengl-driver/lib on NixOS),
-          # not from nixpkgs' nvidia_x11 which must match the running kernel driver exactly.
           shellHook = ''
-            export LD_LIBRARY_PATH="/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            echo "rvm-webcam dev shell: python=$(python --version), cuda available via torch.cuda.is_available()"
+            export ROCM_PATH="${pkgs.rocmPackages.clr}"
+            export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            # Override for GPUs not yet in this ROCm version's GPU list (e.g. RDNA 4 / gfx1201).
+            # Remove or change this if your GPU is fully supported.
+            export HSA_OVERRIDE_GFX_VERSION="12.0.1"
+            echo "rvm-webcam dev shell: python=$(python --version), rocm available via torch.cuda.is_available()"
           '';
         };
 
@@ -206,11 +207,14 @@
           runtimeInputs = [
             pythonEnv
             pkgs.v4l-utils
-            pkgs.git # torch.hub.load clones PeterL1n/RobustVideoMatting at runtime
+            pkgs.git
+            pkgs.rocmPackages.clr
           ];
           text = ''
             export TORCH_HOME="''${TORCH_HOME:-''${XDG_CACHE_HOME:-$HOME/.cache}/torch}"
-            export LD_LIBRARY_PATH="/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export ROCM_PATH="${pkgs.rocmPackages.clr}"
+            export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export HSA_OVERRIDE_GFX_VERSION="12.0.1"
             exec ${pythonEnv}/bin/python ${./src/rvm_webcam.py} "$@"
           '';
         };
