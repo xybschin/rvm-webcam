@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,6 +29,8 @@ def open_capture(device: str, width: int, height: int, fps: int) -> cv2.VideoCap
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, fps)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # cuts USB bandwidth at high res
+    # Minimize kernel-side buffering so the grabber always reads the freshest frame.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     if (actual_w, actual_h) != (width, height):
@@ -37,6 +40,165 @@ def open_capture(device: str, width: int, height: int, fps: int) -> cv2.VideoCap
             err=True,
         )
     return cap
+
+
+class FrameGrabber:
+    """Background thread that drains the V4L2 queue and retains only the freshest frame.
+
+    When inference can't keep pace with the camera, OpenCV's ``cap.read()`` returns
+    frames that have been sitting in kernel buffers, so the pipeline processes stale
+    data and effective throughput collapses. This thread continuously reads from the
+    capture device and overwrites a single slot, so the consumer always gets the most
+    recent frame and stale frames are dropped automatically.
+    """
+
+    def __init__(self, cap):
+        self.cap = cap
+        self._cond = threading.Condition()
+        self._frame = None
+        self._new = False
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stopped:
+            ret, frame = self.cap.read()
+            if not ret:
+                # Brief yield on read failure to avoid a busy spin.
+                time.sleep(0.001)
+                continue
+            with self._cond:
+                self._frame = frame
+                self._new = True
+                self._cond.notify_all()
+
+    def wait_new(self, timeout=1.0):
+        """Block until a frame newer than the last consumed one is available, then
+        return it (or None on timeout). Implicitly rate-limits the consumer to the
+        camera's framerate when the consumer is faster than the camera."""
+        with self._cond:
+            if not self._new:
+                self._cond.wait(timeout=timeout)
+                if not self._new:
+                    return None
+            self._new = False
+            return self._frame
+
+    def stop(self):
+        self._stopped = True
+        with self._cond:
+            self._cond.notify_all()
+        self._thread.join(timeout=1.0)
+
+
+class FramePrep:
+    """Pipelined CPU preparation (resize + BGR->RGB + NCHW pack) on a background thread.
+
+    Runs concurrently with GPU inference: while the main thread is running the model
+    for frame N, this thread is preparing frame N+1. Prepared frames land in one of two
+    pinned uint8 NCHW buffers (double-buffered) so H2D transfers can be issued with
+    ``non_blocking=True`` and overlap with the previous frame's D2H + vcam.send.
+    Only the most recently prepared buffer is kept; older unconsumed ones are dropped.
+    """
+
+    def __init__(self, grabber: FrameGrabber, width: int, height: int):
+        self.grabber = grabber
+        self.W = width
+        self.H = height
+        self.bufs = [
+            torch.empty((1, 3, height, width), dtype=torch.uint8, pin_memory=True),
+            torch.empty((1, 3, height, width), dtype=torch.uint8, pin_memory=True),
+        ]
+        self._cond = threading.Condition()
+        self._ready_idx = None  # index of buffer holding the freshest prepared frame
+        self._inuse_idx = None  # index currently held by the main thread for H2D
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _free_idx(self):
+        for i in (0, 1):
+            if i != self._ready_idx and i != self._inuse_idx:
+                return i
+        return None
+
+    def _run(self):
+        while not self._stopped:
+            frame = self.grabber.wait_new(timeout=1.0)
+            if frame is None:
+                continue
+            if frame.shape[1] != self.W or frame.shape[0] != self.H:
+                frame = cv2.resize(frame, (self.W, self.H))
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Permute to NCHW and make contiguous; this is the only per-frame CPU alloc.
+            t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).contiguous()
+            with self._cond:
+                fi = None
+                while not self._stopped:
+                    fi = self._free_idx()
+                    if fi is not None:
+                        break
+                    self._cond.wait(timeout=1.0)
+                if fi is None:
+                    return
+                self.bufs[fi].copy_(t)
+                self._ready_idx = fi  # overwrites any older unconsumed ready buffer
+                self._cond.notify_all()
+
+    def take(self, timeout=5.0):
+        """Block until a prepared frame is available; returns (index, buffer).
+        Marks the buffer in-use so the prep thread won't reuse it, and clears ready
+        so the next prepared frame is always the freshest."""
+        with self._cond:
+            while self._ready_idx is None and not self._stopped:
+                if not self._cond.wait(timeout=timeout):
+                    if self._ready_idx is None:
+                        continue
+            if self._stopped or self._ready_idx is None:
+                return None, None
+            idx = self._ready_idx
+            self._ready_idx = None
+            self._inuse_idx = idx
+            return idx, self.bufs[idx]
+
+    def release(self, idx):
+        """Mark the in-use buffer free again once its H2D transfer has completed."""
+        with self._cond:
+            if self._inuse_idx == idx:
+                self._inuse_idx = None
+            self._cond.notify_all()
+
+    def stop(self):
+        self._stopped = True
+        with self._cond:
+            self._cond.notify_all()
+        self._thread.join(timeout=1.0)
+
+
+class CapturePipeline:
+    """Owns the capture device plus its grabber/prep helper threads as a unit."""
+
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+        self.cap = None
+        self.grabber = None
+        self.prep = None
+
+    def start(self, input_device: str, fps: int):
+        self.cap = open_capture(input_device, self.width, self.height, fps)
+        self.grabber = FrameGrabber(self.cap)
+        self.prep = FramePrep(self.grabber, self.width, self.height)
+
+    def stop(self):
+        if self.prep is not None:
+            self.prep.stop()
+        if self.grabber is not None:
+            self.grabber.stop()
+        if self.cap is not None:
+            self.cap.release()
+        self.prep = self.grabber = self.cap = None
 
 
 def _consumer_count(output_device: str) -> int:
@@ -132,6 +294,7 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
     if bg_color and bg_image:
         raise click.UsageError("--bg-color and --bg-image are mutually exclusive.")
 
+    _real_stdout = None
     if preview:
         if sys.stdout.isatty():
             click.echo(
@@ -157,6 +320,10 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
 
     _backend = "rocm" if _is_rocm else device
     click.echo(f"[rvm-webcam] device={_backend} dtype={dtype} downsample_ratio={downsample_ratio}")
+
+    # Fixed input shape -> let cuDNN/MIOpen pick the fastest kernels.
+    if not _is_rocm:
+        torch.backends.cudnn.benchmark = True
 
     model = load_model(model_path, backbone, device)
 
@@ -201,18 +368,39 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
     vcam = pyvirtualcam.Camera(width=width, height=height, fps=fps, device=output_device)
     click.echo(f"[rvm-webcam] virtual camera live on {output_device}")
 
+    use_cuda = device == "cuda"
+
+    # Two ping-pong GPU src tensors so H2D of frame N+1 can overlap with the
+    # inference / composite / D2H of frame N on the default stream.
+    src_gpu = [torch.empty((1, 3, height, width), device=device, dtype=dtype) for _ in range(2)]
+    h2d_stream = torch.cuda.Stream() if use_cuda else None
+    h2d_events: list[torch.cuda.Event] = (
+        [torch.cuda.Event(), torch.cuda.Event()] if use_cuda else []
+    )
+
+    def launch_h2d(buf, dst, slot):
+        if use_cuda:
+            with torch.cuda.stream(h2d_stream):
+                dst.copy_(buf, non_blocking=True)
+                dst.div_(255.0)
+            h2d_events[slot].record(h2d_stream)
+        else:
+            dst.copy_(buf)
+            dst.div_(255.0)
+
+    pipeline = CapturePipeline(width, height)
+
+    # Defined unconditionally so the on-demand branch below is always well-formed;
+    # they are only read while running in on-demand mode.
+    last_poll = 0.0
+    POLL_INTERVAL = 1.0
+    black_frame = np.zeros((height, width, 3), dtype=np.uint8)
     if on_demand:
-        cap = None
-        wakelock = None
-        last_poll = 0.0
-        DEBOUNCE_SEC = 0.0
-        POLL_INTERVAL = 1.0
-        black_frame = np.zeros((height, width, 3), dtype=np.uint8)
         click.echo(
             f"[rvm-webcam] on-demand enabled: webcam opens when consumer reads {output_device}"
         )
     else:
-        cap = open_capture(input_device, width, height, fps)
+        pipeline.start(input_device, fps)
 
     rec = [None] * 4
     running = True
@@ -227,6 +415,13 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
 
     frame_count = 0
     t_start = time.time()
+    original_model = model  # retained for torch.compile runtime fallback
+
+    # Two-slot ping-pong: src_gpu[cur] holds the frame being inferred this
+    # iteration; its H2D was launched at the tail of the previous iteration.
+    # prev_buf_idx is the prep buffer still held (in-use) for that H2D.
+    cur = 0
+    prev_buf_idx = None
 
     try:
         with torch.no_grad():
@@ -238,77 +433,101 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                         consumers = _consumer_count(output_device)
 
                         if consumers > 0:
-                            if cap is None:
+                            if pipeline.cap is None:
                                 click.echo(
                                     f"[rvm-webcam] {consumers} consumer(s) connected, opening webcam",
                                     err=True,
                                 )
                                 try:
-                                    cap = open_capture(input_device, width, height, fps)
+                                    pipeline.start(input_device, fps)
                                 except RuntimeError as e:
                                     click.echo(f"[rvm-webcam] {e}, retrying...", err=True)
-                                    cap = None
+                                    pipeline.stop()
                                     continue
                                 rec = [None] * 4
                                 frame_count = 0
-                            wakelock = None
+                                cur = 0
+                                prev_buf_idx = None
                         else:
-                            if cap is not None:
-                                if wakelock is None:
-                                    wakelock = now
-                                elif now - wakelock >= DEBOUNCE_SEC:
-                                    click.echo(
-                                        "[rvm-webcam] no consumers for 2s, releasing webcam",
-                                        err=True,
-                                    )
-                                    cap.release()
-                                    cap = None
-                                    wakelock = None
-                                    rec = [None] * 4
+                            if pipeline.cap is not None:
+                                click.echo(
+                                    "[rvm-webcam] no consumers, releasing webcam",
+                                    err=True,
+                                )
+                                pipeline.stop()
+                                rec = [None] * 4
 
-                    if cap is None:
+                    if pipeline.cap is None:
                         vcam.send(black_frame)
                         vcam.sleep_until_next_frame()
                         continue
 
-                ret, frame = cap.read()
-                if not ret:
-                    click.echo("[rvm-webcam] frame read failed, retrying...", err=True)
-                    time.sleep(0.01)
+                # cap is now known to be open -> prep and grabber are live.
+                prep = pipeline.prep
+                assert prep is not None
+
+                if prev_buf_idx is None:
+                    # Bootstrap: pull the first prepared frame and launch its H2D.
+                    # The next iteration will infer it.
+                    idx, buf = prep.take(timeout=5.0)
+                    if buf is None:
+                        continue
+                    launch_h2d(buf, src_gpu[cur], cur)
+                    prev_buf_idx = idx
                     continue
 
-                if frame.shape[1] != width or frame.shape[0] != height:
-                    frame = cv2.resize(frame, (width, height))
+                # 1. Ensure the current frame's H2D has landed on src_gpu[cur], then
+                #    release its source buffer so the prep thread can refill it.
+                if use_cuda:
+                    h2d_events[cur].wait()
+                prep.release(prev_buf_idx)
 
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                src = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype) / 255.0
-
-                with torch.autocast(device_type=device, dtype=dtype, enabled=(device != "cpu")):
-                    try:
-                        fgr, pha, *rec = model(src, *rec, downsample_ratio)
-                    except Exception:
-                        if use_compile:
-                            click.echo(
-                                "[rvm-webcam] WARNING: torch.compile failed at runtime; "
-                                "falling back to uncompiled model",
-                                err=True,
-                            )
-                            model = original_model
-                            use_compile = False
-                            fgr, pha, *rec = model(src, *rec, downsample_ratio)
-                        else:
-                            raise
+                # 2. Inference + composite for the current frame. While this runs on
+                #    the default stream, the prep thread prepares frame N+1 on the CPU.
+                try:
+                    fgr, pha, *rec = model(src_gpu[cur], *rec, downsample_ratio)
+                except Exception:
+                    if use_compile:
+                        click.echo(
+                            "[rvm-webcam] WARNING: torch.compile failed at runtime; "
+                            "falling back to uncompiled model",
+                            err=True,
+                        )
+                        model = original_model
+                        use_compile = False
+                        fgr, pha, *rec = model(src_gpu[cur], *rec, downsample_ratio)
+                    else:
+                        raise
 
                 com = fgr * pha + bg_tensor * (1 - pha)
-                out = (com[0].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
+                out_gpu = (com[0].permute(1, 2, 0).clamp(0, 1) * 255).byte()
 
+                # 3. Take the next prepared buffer and launch its H2D on the side
+                #    stream. This transfer overlaps with the D2H + vcam.send below.
+                nxt = 1 - cur
+                idx, buf = prep.take(timeout=5.0)
+                if buf is None:
+                    # Shutting down; still emit the current frame before bailing.
+                    out = out_gpu.cpu().numpy()
+                    vcam.send(out)
+                    if _real_stdout is not None:
+                        _real_stdout.buffer.write(out.tobytes())
+                        _real_stdout.buffer.flush()
+                    break
+                launch_h2d(buf, src_gpu[nxt], nxt)
+
+                # 4. D2H + send (default stream) runs concurrently with the H2D of
+                #    frame N+1 already issued on the side stream in step 3.
+                out = out_gpu.cpu().numpy()
                 vcam.send(out)
 
-                if preview:
+                if _real_stdout is not None:
                     _real_stdout.buffer.write(out.tobytes())
                     _real_stdout.buffer.flush()
 
                 frame_count += 1
+                prev_buf_idx = idx
+                cur = nxt
 
                 vcam.sleep_until_next_frame()
 
@@ -316,8 +535,7 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                     elapsed = time.time() - t_start
                     click.echo(f"[rvm-webcam] {frame_count / elapsed:.1f} fps avg")
     finally:
-        if cap is not None:
-            cap.release()
+        pipeline.stop()
         vcam.close()
         click.echo("[rvm-webcam] released camera and virtual device, exiting.")
 
