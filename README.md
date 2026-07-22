@@ -1,12 +1,12 @@
 # rvm-webcam
 
-Real-time background removal virtual camera using [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting). Captures webcam, removes background via **AMD (ROCm)** or **NVIDIA (CUDA)** GPU (with CPU fallback), composites a color/image background, outputs to a v4l2loopback device.
+Real-time background removal virtual camera using [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting).
 
 ## Prerequisites
 
-1. **AMD GPU** (GCN 4th gen / Polaris or newer) with ROCm-compatible driver, or **NVIDIA GPU** with CUDA driver, or CPU-only fallback.
-2. Load v4l2loopback ([setup below](#v4l2loopback-setup)).
-3. Download a model checkpoint:
+1. **AMD (ROCm)** or **NVIDIA (CUDA)** GPU (CPU fallback works).
+2. Load v4l2loopback ([see below](#v4l2loopback-setup)).
+3. Download model checkpoint:
    ```sh
    curl -fL -o models/rvm_mobilenetv3.pth \
      https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth
@@ -18,18 +18,7 @@ Real-time background removal virtual camera using [RobustVideoMatting](https://g
 nix run github:xybschin/rvm-webcam --impure -- --model-path models/rvm_mobilenetv3.pth
 ```
 
-Only `--model-path` is required; all other flags have defaults. Press `Ctrl-C` to clean up.
-
-> First run fetches the RVM architecture via `torch.hub` (needs `git` + internet). Subsequent runs use `~/.cache/torch/hub/`.
-
-Preview to ffplay (no display server needed):
-
-```sh
-nix run github:xybschin/rvm-webcam --impure -- --model-path models/rvm_mobilenetv3.pth --preview \
-  | ffplay -f rawvideo -pixel_format rgb24 -video_size 1280x720 -i -
-```
-
-### Options
+Options can also be set in `~/.config/rvm-webcam/config.json` (underscores, not hyphens). CLI flags override config.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -37,18 +26,13 @@ nix run github:xybschin/rvm-webcam --impure -- --model-path models/rvm_mobilenet
 | `--backbone` | `mobilenetv3` | `mobilenetv3` or `resnet50` |
 | `--input-device` | `/dev/video0` | Physical webcam |
 | `--output-device` | `/dev/video10` | v4l2loopback virtual device |
-| `--width` | `1280` | Frame width |
-| `--height` | `720` | Frame height |
-| `--fps` | `30` | Target framerate |
+| `--width` / `--height` / `--fps` | `1280` / `720` / `30` | Capture resolution and framerate |
 | `--downsample-ratio` | `0.25` | Inference resolution fraction (lower = faster) |
-| `--bg-color` | `0,255,0` | Background as `R,G,B` (mutually exclusive with `--bg-image`) |
+| `--bg-color` | `0,255,0` | Background as `R,G,B` |
 | `--bg-image` | — | Background image path (JPG/PNG) |
-| `--compile` | off | `torch.compile` (PyTorch ≥ 2.0, may improve GPU perf) |
 | `--precision` | `auto` | `auto`, `fp16`, or `fp32` |
-| `--preview` | off | Pipe raw RGB24 to stdout for ffplay |
 | `--on-demand` | off | Only open webcam when a consumer reads `/dev/video10` |
-
-All options can also be set in `~/.config/rvm-webcam/config.json` (underscores, not hyphens). CLI flags override config.
+| `--debug` | off | Overlay FPS and stage timings on the output frame |
 
 ## v4l2loopback setup
 
@@ -62,4 +46,25 @@ All options can also be set in `~/.config/rvm-webcam/config.json` (underscores, 
   ```
 - **Other distros:** `sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="rvm-webcam" exclusive_caps=1`
 
-Creates `/dev/video10`. Verify with `v4l2-ctl --list-devices`.
+## Building
+
+```sh
+nix develop --impure         # dev shell with ROCm torch + tooling
+nix build . --impure         # standalone binary
+./result/bin/rvm-webcam --model-path models/rvm_mobilenetv3.pth
+```
+
+## NixOS / home-manager module
+
+```nix
+{
+  inputs.rvm-webcam.url = "github:xybschin/rvm-webcam";
+  # Add rvm-webcam.nixosModules.default or rvm-webcam.homeManagerModules.default
+
+  services.rvm-webcam = {
+    enable = true;
+    modelPath = "/home/you/models/rvm_mobilenetv3.pth";
+    # Optional: backbone, width, height, fps, extraConfig = { bg_color = "0,255,0"; ... }
+  };
+}
+```

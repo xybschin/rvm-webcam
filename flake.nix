@@ -137,6 +137,15 @@
             rocmSupport = true;
             rocmTargets = [ "gfx1201" ];
           };
+          overlays = [
+            (final: prev: {
+              python312 = prev.python312.override {
+                packageOverrides = self: super: {
+                  pytorch = super.pytorch.override { enableAotriton = false; };
+                };
+              };
+            })
+          ];
         };
 
         pythonPackages = pkgs.python312Packages;
@@ -206,14 +215,12 @@
             pythonEnv
             pkgs.v4l-utils
             pkgs.git
-            pkgs.gcc
             pkgs.rocmPackages.clr
           ];
           text = ''
             export TORCH_HOME="''${TORCH_HOME:-''${XDG_CACHE_HOME:-$HOME/.cache}/torch}"
             export ROCM_PATH="${pkgs.rocmPackages.clr}"
             export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            export CC=gcc
             exec ${pythonEnv}/bin/python ${./src/rvm_webcam.py} "$@"
           '';
         };
