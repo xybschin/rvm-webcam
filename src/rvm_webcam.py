@@ -326,6 +326,9 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
         torch.backends.cudnn.benchmark = True
 
     model = load_model(model_path, backbone, device)
+    # Convert model weights to compute dtype so they match src_gpu without autocast.
+    model = model.to(dtype)
+    original_model = model  # kept for torch.compile runtime fallback
 
     if use_compile:
         if not hasattr(torch, "compile"):
@@ -415,8 +418,12 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
 
     frame_count = 0
     t_start = time.time()
-    original_model = model  # retained for torch.compile runtime fallback
-
+    # Stage timing accumulators (in nanoseconds).
+    acc_h2d = 0
+    acc_infer = 0
+    acc_take = 0
+    acc_d2h = 0
+    acc_sleep = 0
     # Two-slot ping-pong: src_gpu[cur] holds the frame being inferred this
     # iteration; its H2D was launched at the tail of the previous iteration.
     # prev_buf_idx is the prep buffer still held (in-use) for that H2D.
@@ -446,6 +453,8 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                                     continue
                                 rec = [None] * 4
                                 frame_count = 0
+                                t_start = time.time()
+                                acc_h2d = acc_infer = acc_take = acc_d2h = acc_sleep = 0
                                 cur = 0
                                 prev_buf_idx = None
                         else:
@@ -478,9 +487,12 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
 
                 # 1. Ensure the current frame's H2D has landed on src_gpu[cur], then
                 #    release its source buffer so the prep thread can refill it.
+                t0 = time.perf_counter_ns()
                 if use_cuda:
                     h2d_events[cur].wait()
                 prep.release(prev_buf_idx)
+                t1 = time.perf_counter_ns()
+                acc_h2d += t1 - t0
 
                 # 2. Inference + composite for the current frame. While this runs on
                 #    the default stream, the prep thread prepares frame N+1 on the CPU.
@@ -498,6 +510,8 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                         fgr, pha, *rec = model(src_gpu[cur], *rec, downsample_ratio)
                     else:
                         raise
+                t2 = time.perf_counter_ns()
+                acc_infer += t2 - t1
 
                 com = fgr * pha + bg_tensor * (1 - pha)
                 out_gpu = (com[0].permute(1, 2, 0).clamp(0, 1) * 255).byte()
@@ -506,6 +520,8 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                 #    stream. This transfer overlaps with the D2H + vcam.send below.
                 nxt = 1 - cur
                 idx, buf = prep.take(timeout=5.0)
+                t3 = time.perf_counter_ns()
+                acc_take += t3 - t2
                 if buf is None:
                     # Shutting down; still emit the current frame before bailing.
                     out = out_gpu.cpu().numpy()
@@ -529,11 +545,24 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
                 prev_buf_idx = idx
                 cur = nxt
 
+                t4 = time.perf_counter_ns()
                 vcam.sleep_until_next_frame()
+                t5 = time.perf_counter_ns()
+                acc_sleep += t5 - t4
+                acc_d2h += t4 - t3
 
                 if frame_count % 100 == 0 and frame_count > 0:
-                    elapsed = time.time() - t_start
-                    click.echo(f"[rvm-webcam] {frame_count / elapsed:.1f} fps avg")
+                    n = frame_count
+                    ms = lambda ns: ns / 1e6
+                    click.echo(
+                        f"[rvm-webcam] {frame_count / (t5 / 1e9):.1f} fps  "
+                        f"h2d={ms(acc_h2d/n):.1f}  "
+                        f"infer={ms(acc_infer/n):.1f}  "
+                        f"take={ms(acc_take/n):.1f}  "
+                        f"d2h+send={ms(acc_d2h/n):.1f}  "
+                        f"sleep={ms(acc_sleep/n):.1f}",
+                        err=True,
+                    )
     finally:
         pipeline.stop()
         vcam.close()
