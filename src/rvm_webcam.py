@@ -744,6 +744,8 @@ DEFAULTS = {
     "downsample_ratio": 0.25,
     "device_id": 0,
     "cache_dir": None,
+    "bg_color": "0,255,0",
+    "bg_image": None,
 }
 
 
@@ -758,6 +760,50 @@ def _load_config():
     return {}
 
 
+def _load_background(
+    bg_image: str | None, bg_color: str | None, width: int, height: int
+) -> np.ndarray:
+    """Return the composite background as a float32 array.
+
+    If *bg_image* is given, returns a full ``(height, width, 3)`` RGB
+    array (resized to the output resolution). Otherwise parses
+    *bg_color* as an ``"R,G,B"`` string and returns a broadcastable
+    ``(3,)`` array -- the compositor's ``bg * (1 - pha)`` term
+    broadcasts either shape correctly against the ``(height, width, 3)``
+    foreground/alpha.
+    """
+    if bg_image:
+        from PIL import Image
+
+        try:
+            img = Image.open(bg_image).convert("RGB").resize((width, height))
+        except Exception as exc:
+            raise click.BadParameter(
+                f"Could not load image: {bg_image} ({exc})", param_hint="--bg-image"
+            )
+        click.echo(f"[rvm-webcam] Using background image: {bg_image}")
+        return np.array(img, dtype=np.float32)
+
+    bg_color = bg_color or "0,255,0"
+    parts = bg_color.split(",")
+    if len(parts) != 3:
+        raise click.BadParameter(
+            f"expected 'R,G,B', got {bg_color!r}", param_hint="--bg-color"
+        )
+    try:
+        r, g, b = (int(p) for p in parts)
+    except ValueError:
+        raise click.BadParameter(
+            f"R,G,B values must be integers, got {bg_color!r}", param_hint="--bg-color"
+        )
+    if not all(0 <= c <= 255 for c in (r, g, b)):
+        raise click.BadParameter(
+            f"R,G,B values must be in 0-255, got {bg_color!r}", param_hint="--bg-color"
+        )
+    click.echo(f"[rvm-webcam] Using background color: {r},{g},{b}")
+    return np.array([r, g, b], dtype=np.float32)
+
+
 @click.command()
 @click.option("--model-path", type=click.Path(exists=True))
 @click.option("--input-device")
@@ -768,6 +814,8 @@ def _load_config():
 @click.option("--downsample-ratio", type=float)
 @click.option("--device-id", type=int)
 @click.option("--cache-dir", type=click.Path(), default=None, help="MIGraphX .mxr compile cache directory (avoids recompilation on restart)")
+@click.option("--bg-color", default=None, help="Composite background as 'R,G,B' (default: 0,255,0). Mutually exclusive with --bg-image.")
+@click.option("--bg-image", default=None, type=click.Path(exists=True), help="Composite background image path (JPG/PNG). Mutually exclusive with --bg-color.")
 def main(
     model_path,
     input_device,
@@ -778,6 +826,8 @@ def main(
     downsample_ratio,
     device_id,
     cache_dir,
+    bg_color,
+    bg_image,
 ):
     cfg = _load_config()
     model_path = model_path or cfg.get("model_path") or DEFAULTS["model_path"]
@@ -793,6 +843,14 @@ def main(
     )
     device_id = device_id or cfg.get("device_id") or DEFAULTS["device_id"]
     cache_dir = cache_dir or cfg.get("cache_dir") or DEFAULTS["cache_dir"]
+
+    bg_color_explicit = bg_color or cfg.get("bg_color")
+    bg_image = bg_image or cfg.get("bg_image") or DEFAULTS["bg_image"]
+
+    if bg_color_explicit and bg_image:
+        raise click.UsageError("--bg-color and --bg-image are mutually exclusive.")
+
+    bg_color = None if bg_image else (bg_color_explicit or DEFAULTS["bg_color"])
 
     error_q = queue.Queue()
 
@@ -842,7 +900,7 @@ def main(
             "only open while a consumer is attached to the virtual camera."
         )
 
-    bg_color = np.array([0, 255, 0], dtype=np.float32)
+    bg = _load_background(bg_image, bg_color, width, height)
     running = True
 
     def shutdown(signum, frame):
@@ -950,7 +1008,7 @@ def main(
     # never starts because no consumer has connected yet. Only the
     # physical camera capture + GPU inference are gated; the virtual
     # camera output always stays live.
-    idle_frame = np.tile(bg_color.astype(np.uint8), (height, width, 1))
+    idle_frame = np.broadcast_to(bg, (height, width, 3)).astype(np.uint8).copy()
 
     try:
         while running:
@@ -1021,7 +1079,7 @@ def main(
             pha_sq = pha_out[0, 0, ..., None]
             fgr_sq = fgr_out[0].transpose(1, 2, 0) * 255.0
 
-            com = (fgr_sq * pha_sq + bg_color * (1.0 - pha_sq)).clip(0, 255).astype(np.uint8)
+            com = (fgr_sq * pha_sq + bg * (1.0 - pha_sq)).clip(0, 255).astype(np.uint8)
 
             vcam.send(com)
 

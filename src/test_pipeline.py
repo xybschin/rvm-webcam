@@ -18,6 +18,7 @@ from rvm_webcam import (
     PinnedBuffer,
     RecurrentStateBufferGPU,
     WorkerException,
+    _load_background,
     _load_hip_runtime,
     allocate_pinned_numpy,
 )
@@ -439,3 +440,85 @@ def test_loopback_consumer_monitor_detects_real_consumer(loopback_device):
             cam.close()
     finally:
         mon.stop()
+
+
+# ---------------------------------------------------------------------------
+# 7. Composite Background Loading (--bg-color / --bg-image)
+# ---------------------------------------------------------------------------
+
+
+def test_load_background_default_color():
+    """_load_background with no image falls back to the given bg_color
+    string, returning a broadcastable (3,) RGB array."""
+    bg = _load_background(None, "0,255,0", width=100, height=50)
+    assert bg.shape == (3,)
+    assert bg.dtype == np.float32
+    assert np.array_equal(bg, [0, 255, 0])
+
+
+def test_load_background_custom_color():
+    bg = _load_background(None, "10,20,30", width=100, height=50)
+    assert np.array_equal(bg, [10, 20, 30])
+
+
+def test_load_background_color_wrong_arity():
+    import click
+
+    with pytest.raises(click.BadParameter, match="expected 'R,G,B'"):
+        _load_background(None, "10,20", width=100, height=50)
+
+
+def test_load_background_color_non_integer():
+    import click
+
+    with pytest.raises(click.BadParameter, match="must be integers"):
+        _load_background(None, "a,b,c", width=100, height=50)
+
+
+def test_load_background_color_out_of_range():
+    import click
+
+    with pytest.raises(click.BadParameter, match="must be in 0-255"):
+        _load_background(None, "300,20,30", width=100, height=50)
+
+
+def test_load_background_image(tmp_path):
+    """_load_background with bg_image loads, converts to RGB, and resizes
+    to the target (height, width) -- returning a full-frame array rather
+    than a broadcastable color."""
+    from PIL import Image
+
+    img_path = tmp_path / "bg.png"
+    Image.new("RGB", (200, 100), color=(50, 100, 150)).save(img_path)
+
+    bg = _load_background(str(img_path), None, width=1280, height=720)
+    assert bg.shape == (720, 1280, 3)
+    assert bg.dtype == np.float32
+    assert np.allclose(bg[0, 0], [50, 100, 150])
+    assert np.allclose(bg[-1, -1], [50, 100, 150])
+
+
+def test_load_background_image_missing_file():
+    import click
+
+    with pytest.raises(click.BadParameter, match="Could not load image"):
+        _load_background("/nonexistent/path/to/image.png", None, width=100, height=50)
+
+
+def test_composite_math_with_image_background(tmp_path):
+    """Sanity-check the fgr*pha + bg*(1-pha) formula the main loop uses,
+    confirming a full-frame image background broadcasts correctly
+    against a (H, W, 1) alpha channel."""
+    from PIL import Image
+
+    img_path = tmp_path / "bg.png"
+    Image.new("RGB", (10, 10), color=(50, 100, 150)).save(img_path)
+    bg = _load_background(str(img_path), None, width=10, height=10)
+
+    pha_sq = np.full((10, 10, 1), 0.5, dtype=np.float32)
+    fgr_sq = np.full((10, 10, 3), 200.0, dtype=np.float32)
+    com = (fgr_sq * pha_sq + bg * (1.0 - pha_sq)).clip(0, 255).astype(np.uint8)
+
+    assert com.shape == (10, 10, 3)
+    expected_r = int(200 * 0.5 + 50 * 0.5)
+    assert abs(int(com[0, 0, 0]) - expected_r) <= 1
