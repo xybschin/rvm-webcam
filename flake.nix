@@ -1,5 +1,5 @@
 {
-  description = "rvm-webcam - background removal virtual camera CLI";
+  description = "rvm-webcam - background removal virtual camera CLI (ROCm / MIGraphX)";
 
   nixConfig = {
     extra-substituters = [
@@ -27,25 +27,51 @@
           enable = lib.mkEnableOption "rvm-webcam background removal virtual camera";
           modelPath = lib.mkOption {
             type = lib.types.str;
-            description = "Absolute path to the RVM model .pth file";
-          };
-          backbone = lib.mkOption {
-            type = lib.types.enum [ "mobilenetv3" "resnet50" ];
-            default = "mobilenetv3";
-            description = "RVM backbone architecture";
+            description = "Absolute path to the RVM ONNX model (.onnx)";
           };
           width = lib.mkOption { type = lib.types.int; default = 1280; };
           height = lib.mkOption { type = lib.types.int; default = 720; };
           fps = lib.mkOption { type = lib.types.int; default = 30; };
+          cacheDir = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = "/var/cache/rvm-webcam/migraphx";
+            description = ''
+              MIGraphX .mxr compile cache directory (persists compiled model
+              across restarts, avoiding a ~2 minute recompile on every
+              service start). Since this service runs as a per-user
+              `systemd.user.services` unit (not root), this module
+              provisions the directory via `systemd.tmpfiles.rules` so it
+              is writable by any member of the `video` group.
+            '';
+          };
           extraConfig = lib.mkOption {
             type = lib.types.attrsOf lib.types.raw;
             default = { };
-            description = "Additional config.json entries (e.g. bg_color, precision)";
+            description = "Additional config.json entries (e.g. downsample_ratio, device_id)";
           };
         };
 
         config = lib.mkIf config.services.rvm-webcam.enable {
+          boot.kernelModules = [ "v4l2loopback" ];
+          boot.extraModprobeConfig = ''
+            options v4l2loopback exclusive_caps=0 video_nr=10 card_label="RVM Webcam"
+          '';
+
           environment.systemPackages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+
+          # Cameras (/dev/video*) and GPU render nodes (/dev/dri/render*,
+          # /dev/kfd) are group-owned by `video`/`render`; the invoking
+          # user must be a member of both for the pipeline to open them.
+          # This is NOT enforced automatically -- add the user manually:
+          #   users.users.<name>.extraGroups = [ "video" "render" ];
+
+          # `systemd.user.services` run as the unprivileged user, so the
+          # default /var/cache/rvm-webcam/migraphx (root:root 0755) must
+          # be pre-created and made writable, or MIGraphXSession's
+          # `cache_path.mkdir()` will fail with a permission error.
+          systemd.tmpfiles.rules = lib.optional (config.services.rvm-webcam.cacheDir != null) (
+            "d ${config.services.rvm-webcam.cacheDir} 0775 root video - -"
+          );
 
           systemd.user.services.rvm-webcam = {
             description = "rvm-webcam background removal virtual camera";
@@ -55,7 +81,7 @@
             wantedBy = [ "graphical-session.target" ];
             serviceConfig = {
               Type = "simple";
-              ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/rvm-webcam --on-demand";
+              ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/rvm-webcam";
               Restart = "on-failure";
               RestartSec = "3";
             };
@@ -64,10 +90,10 @@
           environment.etc."rvm-webcam/config.json".text = builtins.toJSON (
             {
               model_path = config.services.rvm-webcam.modelPath;
-              backbone = config.services.rvm-webcam.backbone;
               width = config.services.rvm-webcam.width;
               height = config.services.rvm-webcam.height;
               fps = config.services.rvm-webcam.fps;
+              cache_dir = config.services.rvm-webcam.cacheDir;
             } // config.services.rvm-webcam.extraConfig
           );
         };
@@ -77,20 +103,24 @@
           enable = lib.mkEnableOption "rvm-webcam background removal virtual camera";
           modelPath = lib.mkOption {
             type = lib.types.str;
-            description = "Absolute path to the RVM model .pth file";
-          };
-          backbone = lib.mkOption {
-            type = lib.types.enum [ "mobilenetv3" "resnet50" ];
-            default = "mobilenetv3";
-            description = "RVM backbone architecture";
+            description = "Absolute path to the RVM ONNX model (.onnx)";
           };
           width = lib.mkOption { type = lib.types.int; default = 1280; };
           height = lib.mkOption { type = lib.types.int; default = 720; };
           fps = lib.mkOption { type = lib.types.int; default = 30; };
+          cacheDir = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              MIGraphX .mxr compile cache directory (persists compiled model
+              across restarts).  Set to a path under XDG_CACHE_HOME to enable,
+              e.g. "rvm-webcam/migraphx".
+            '';
+          };
           extraConfig = lib.mkOption {
             type = lib.types.attrsOf lib.types.raw;
             default = { };
-            description = "Additional config.json entries (e.g. bg_color, precision)";
+            description = "Additional config.json entries (e.g. downsample_ratio, device_id)";
           };
         };
 
@@ -106,7 +136,7 @@
             };
             Service = {
               Type = "simple";
-              ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/rvm-webcam --on-demand";
+              ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/rvm-webcam";
               Restart = "on-failure";
               RestartSec = "3";
             };
@@ -118,10 +148,10 @@
           xdg.configFile."rvm-webcam/config.json".text = builtins.toJSON (
             {
               model_path = config.services.rvm-webcam.modelPath;
-              backbone = config.services.rvm-webcam.backbone;
               width = config.services.rvm-webcam.width;
               height = config.services.rvm-webcam.height;
               fps = config.services.rvm-webcam.fps;
+              cache_dir = config.services.rvm-webcam.cacheDir;
             } // config.services.rvm-webcam.extraConfig
           );
         };
@@ -135,17 +165,7 @@
           config = {
             allowUnfree = true;
             rocmSupport = true;
-            rocmTargets = [ "gfx1201" ];
           };
-          overlays = [
-            (final: prev: {
-              python312 = prev.python312.override {
-                packageOverrides = self: super: {
-                  pytorch = super.pytorch.override { enableAotriton = false; };
-                };
-              };
-            })
-          ];
         };
 
         pythonPackages = pkgs.python312Packages;
@@ -161,21 +181,34 @@
           propagatedBuildInputs = [ pythonPackages.numpy ];
         };
 
-        opencv4-python = pythonPackages.toPythonModule (
-          pkgs.opencv4.override {
-            enablePython = true;
-            pythonPackages = pythonPackages;
-          }
-        );
+        patchedOnnxruntime = pythonPackages.onnxruntime.overrideAttrs (old: {
+          buildInputs = (old.buildInputs or []) ++ [ pkgs.onnxruntime ];
+          postInstall = (old.postInstall or "") + ''
+            ln -sf ${pkgs.onnxruntime}/lib/libonnxruntime_providers_migraphx.so \
+              "$out/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime_providers_migraphx.so"
+          '';
+        });
 
         pythonEnv = pkgs.python312.withPackages (
           ps: with ps; [
-            torch
-            torchvision
-            opencv4-python
+            patchedOnnxruntime
+            pillow
             numpy
             pyvirtualcam
             click
+            ps.onnx
+          ]
+        );
+
+        testEnv = pkgs.python312.withPackages (
+          ps: with ps; [
+            pytest
+            numpy
+            patchedOnnxruntime
+            pillow
+            click
+            pyvirtualcam
+            ps.onnx
           ]
         );
 
@@ -191,6 +224,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pythonEnv
+            testEnv
             lspEnv
             pkgs.ruff
             pkgs.pyright
@@ -204,8 +238,9 @@
 
           shellHook = ''
             export ROCM_PATH="${pkgs.rocmPackages.clr}"
-            export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            echo "rvm-webcam dev shell: python=$(python --version), rocm available via torch.cuda.is_available()"
+            export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib:${pkgs.onnxruntime}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "rvm-webcam dev shell: python=$(python --version) rocm=${pkgs.rocmPackages.clr.version}"
+            echo "run 'pytest src/test_pipeline.py -v' to validate the pipeline"
           '';
         };
 
@@ -218,32 +253,26 @@
             pkgs.rocmPackages.clr
           ];
           text = ''
-            export TORCH_HOME="''${TORCH_HOME:-''${XDG_CACHE_HOME:-$HOME/.cache}/torch}"
             export ROCM_PATH="${pkgs.rocmPackages.clr}"
-            export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib:${pkgs.onnxruntime}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export PYTHONPATH="${./src}:''${PYTHONPATH:+:$PYTHONPATH}"
             exec ${pythonEnv}/bin/python ${./src/rvm_webcam.py} "$@"
           '';
         };
 
-        packages.systemd-unit = pkgs.runCommand "rvm-webcam-systemd-unit" { } ''
-          mkdir -p $out/lib/systemd/user
-          cat > $out/lib/systemd/user/rvm-webcam.service << EOF
-[Unit]
-Description=rvm-webcam background removal virtual camera
-Documentation=https://github.com/xybschin/rvm-webcam
-After=graphical-session.target
-Wants=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=${self.packages.${system}.default}/bin/rvm-webcam --on-demand
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=graphical-session.target
-EOF
-        '';
+        packages.check-environment = pkgs.writeShellApplication {
+          name = "rvm-webcam-check-environment";
+          runtimeInputs = [
+            pythonEnv
+            pkgs.rocmPackages.clr
+          ];
+          text = ''
+            export ROCM_PATH="${pkgs.rocmPackages.clr}"
+            export LD_LIBRARY_PATH="${pkgs.rocmPackages.clr}/lib:${pkgs.onnxruntime}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export PYTHONPATH="${./src}:''${PYTHONPATH:+:$PYTHONPATH}"
+            exec ${pythonEnv}/bin/python ${./src/check_environment.py} "$@"
+          '';
+        };
 
       }
     );
