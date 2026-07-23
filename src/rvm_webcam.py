@@ -1,59 +1,322 @@
 #!/usr/bin/env python3
-"""rvm-webcam: real-time background removal virtual camera using RobustVideoMatting."""
+"""
+High-Performance RVM Virtual Camera (ROCm 6+ / MIGraphX Zero-Copy Engine)
+Optimized for AMD Radeon RX 9070 XT (RDNA 4)
+"""
 
+import copy
+import ctypes
+import ctypes.util
+import dataclasses
+import fcntl
 import json
+import math
+import mmap
 import os
+import queue
+import select
+import shutil
 import signal
+import struct
+import subprocess
 import threading
 import time
 from pathlib import Path
 
+import onnx
+from onnx import helper, TensorProto
+
 import click
-import cv2
 import numpy as np
-import torch
+import onnxruntime as ort
 
 
-def load_model(model_path: str, backbone: str, device: str):
-    model = torch.hub.load("PeterL1n/RobustVideoMatting", backbone).eval().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    return model
+class WorkerException(Exception):
+    """Encapsulates exceptions thrown inside background worker threads."""
+
+    pass
 
 
-def open_capture(device: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open capture device {device}")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, fps)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if (actual_w, actual_h) != (width, height):
-        click.echo(
-            f"[rvm-webcam] WARNING: requested {width}x{height} but device reports "
-            f"{actual_w}x{actual_h}; frames will be resized.",
-            err=True,
-        )
-    return cap
+class LoopbackConsumerMonitor:
+    """Tracks whether a real consumer is reading from a v4l2loopback
+    CAPTURE device, so the GPU pipeline only runs (and the physical
+    camera's "shutter"/LED activates) while something is actually
+    watching the virtual camera.
 
+    v4l2loopback fires a private V4L2 event, ``V4L2_EVENT_PRI_CLIENT_USAGE``
+    (id 0x10e00001), whenever a CAPTURE-side opener calls
+    ``VIDIOC_STREAMON``/``VIDIOC_STREAMOFF``. The event payload's first
+    4 bytes are a ``u32 count`` computed by the driver as
+    ``!has_capture_token(stream_tokens)``, where ``stream_tokens`` bits
+    are *set* when a token is free/unclaimed. So ``count == 0`` means
+    "no consumer is streaming" (capture token still available) and
+    ``count != 0`` means "a consumer has acquired the capture token and
+    is actively streaming". This is the same mechanism browsers/OBS use
+    to show a "camera in use" indicator only when a page/tab is actually
+    reading frames, but pyvirtualcam's Linux backend (a bare ``write()`` to the
+    device) does not expose it, so this reimplements it via raw ioctls.
 
-class FrameGrabber:
-    def __init__(self, cap):
-        self.cap = cap
-        self._cond = threading.Condition()
-        self._frame = None
-        self._new = False
+    Falls back to permanently "active" if the ioctl/event subscription
+    is unavailable (e.g. non-Linux, non-v4l2loopback backend, or an
+    older v4l2loopback version without this event), so pipelines never
+    silently stop producing frames on unsupported platforms.
+    """
+
+    _VIDIOC_SUBSCRIBE_EVENT = 0x4020565A
+    _VIDIOC_DQEVENT = 0x80885659
+    _V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1
+    _V4L2_EVENT_SUB_FL_SEND_INITIAL = 1
+
+    def __init__(self, device: str):
+        self.device = device
+        self._fd: int | None = None
+        self._supported = False
+        self._active = True  # fail-open if monitoring isn't supported
+        self._lock = threading.Lock()
         self._stopped = False
+        self._thread: threading.Thread | None = None
+
+        try:
+            self._fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+            sub = struct.pack(
+                "=III5I",
+                self._V4L2_EVENT_PRI_CLIENT_USAGE,
+                0,
+                self._V4L2_EVENT_SUB_FL_SEND_INITIAL,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            fcntl.ioctl(self._fd, self._VIDIOC_SUBSCRIBE_EVENT, sub)
+            self._supported = True
+            self._active = False  # will be set True by the initial event if a consumer exists
+        except OSError as e:
+            click.echo(
+                f"[rvm-webcam] Warning: consumer detection unavailable on "
+                f"{device} ({e}); pipeline will always run.",
+                err=True,
+            )
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+            return
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self):
+        assert self._fd is not None
         while not self._stopped:
-            ret, frame = self.cap.read()
-            if not ret:
+            try:
+                r, _, x = select.select([self._fd], [], [self._fd], 0.5)
+            except OSError:
+                break
+            if not r and not x:
+                continue
+            while True:
+                buf = bytearray(136)
+                try:
+                    fcntl.ioctl(self._fd, self._VIDIOC_DQEVENT, buf)
+                except OSError:
+                    break
+                count = struct.unpack_from("=I", bytes(buf), 8)[0]
+                with self._lock:
+                    self._active = count != 0
+
+    @property
+    def is_active(self) -> bool:
+        """True if a consumer is currently streaming from the device
+        (or if consumer detection is unsupported and we fail open)."""
+        if not self._supported:
+            return True
+        with self._lock:
+            return self._active
+
+    def stop(self):
+        self._stopped = True
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+
+def _load_hip_runtime() -> ctypes.CDLL | None:
+    """Resolve libamdhip64.so with multi-path fallback.
+
+    Priority:
+      1. ctypes.CDLL('libamdhip64.so') -- relies on LD_LIBRARY_PATH / ld cache
+      2. ctypes.util.find_library('amdhip64')
+      3. Explicit well-known ROCm installation paths
+    """
+    # Strategy 1: default loader
+    try:
+        return ctypes.CDLL("libamdhip64.so")
+    except OSError:
+        pass
+
+    # Strategy 2: ctypes.util.find_library
+    lib_path = ctypes.util.find_library("amdhip64")
+    if lib_path is not None:
+        try:
+            return ctypes.CDLL(lib_path)
+        except OSError:
+            pass
+
+    # Strategy 3: well-known system paths
+    candidates = [
+        "/opt/rocm/lib/libamdhip64.so",
+        "/opt/rocm/hip/lib/libamdhip64.so",
+        "/opt/rocm-6.0.0/lib/libamdhip64.so",
+        "/opt/rocm-6.1.0/lib/libamdhip64.so",
+        "/opt/rocm-6.2.0/lib/libamdhip64.so",
+        "/opt/rocm-6.3.0/lib/libamdhip64.so",
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            try:
+                return ctypes.CDLL(candidate)
+            except OSError:
+                continue
+
+    return None
+
+
+@dataclasses.dataclass
+class PinnedBuffer:
+    """Encapsulates a NumPy array backed by POSIX mmap and registered via HIP DMA."""
+
+    array: np.ndarray
+    buf: mmap.mmap
+    addr: int
+    bytes_needed: int
+    is_pinned: bool
+
+    def cleanup(self):
+        """Unregisters memory from the HIP driver and releases physical locks."""
+        if self.is_pinned:
+            try:
+                hip = _load_hip_runtime()
+                if hip is not None:
+                    rc = hip.hipHostUnregister(ctypes.c_void_p(self.addr))
+                    if rc != 0:
+                        click.echo(
+                            f"[rvm-webcam] Warning: hipHostUnregister failed (rc={rc})",
+                            err=True,
+                        )
+            except Exception as e:
+                click.echo(
+                    f"[rvm-webcam] Warning: Error unloading HIP driver handle: {e}",
+                    err=True,
+                )
+            self.is_pinned = False
+
+        try:
+            libc = ctypes.CDLL(None)
+            libc.munlock(ctypes.c_void_p(self.addr), ctypes.c_size_t(self.bytes_needed))
+        except Exception:
+            pass
+
+        try:
+            self.buf.close()
+        except Exception:
+            pass
+
+
+def allocate_pinned_numpy(shape: tuple, dtype: np.dtype) -> PinnedBuffer:
+    """Allocates page-locked host memory registered with ROCm via hipHostRegister.
+
+    Guarantees DMA access across PCIe without driver staging copies.
+    """
+    dtype = np.dtype(dtype)
+    bytes_needed = int(np.prod(shape) * dtype.itemsize)
+
+    # 1. POSIX Anonymous Shared Memory Mapping
+    buf = mmap.mmap(-1, bytes_needed, flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
+
+    # 2. Extract Base Physical/Virtual Memory Address
+    c_array = (ctypes.c_char * bytes_needed).from_buffer(buf)
+    addr = ctypes.addressof(c_array)
+
+    # 3. Apply POSIX page-lock to avoid swapping
+    try:
+        libc = ctypes.CDLL(None)
+        libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(bytes_needed))
+    except Exception as e:
+        click.echo(f"[rvm-webcam] Warning: mlock failed: {e}", err=True)
+
+    # 4. Register with HIP Runtime for Hardware DMA Access
+    is_pinned = False
+    try:
+        hip = _load_hip_runtime()
+        if hip is not None:
+            rc = hip.hipHostRegister(
+                ctypes.c_void_p(addr), ctypes.c_size_t(bytes_needed), 0
+            )
+            if rc == 0:
+                is_pinned = True
+            else:
+                click.echo(
+                    f"[rvm-webcam] Warning: hipHostRegister failed (rc={rc}). Staging copies will occur.",
+                    err=True,
+                )
+        else:
+            click.echo(
+                "[rvm-webcam] Warning: libamdhip64.so not found via any resolution strategy. Hardware pinning disabled.",
+                err=True,
+            )
+    except OSError as e:
+        click.echo(
+            f"[rvm-webcam] Warning: Could not load libamdhip64.so ({e}). Hardware pinning disabled.",
+            err=True,
+        )
+
+    # 5. Create Zero-Copy NumPy View
+    array = np.frombuffer(buf, dtype=dtype).reshape(shape)
+    if not array.flags.writeable:
+        array.setflags(write=True)
+
+    return PinnedBuffer(
+        array=array,
+        buf=buf,
+        addr=addr,
+        bytes_needed=bytes_needed,
+        is_pinned=is_pinned,
+    )
+
+
+class FrameGrabber:
+    """Continuous background thread draining the V4L2 device buffer queue
+    via an ffmpeg subprocess pipe."""
+
+    def __init__(self, read_fn, error_q: queue.Queue):
+        self._read_fn = read_fn
+        self.error_q = error_q
+        self._cond = threading.Condition()
+        self._frame = None
+        self._new = False
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run_guarded, daemon=True)
+        self._thread.start()
+
+    def _run_guarded(self):
+        try:
+            self._run()
+        except Exception as e:
+            self.error_q.put(WorkerException(f"FrameGrabber failed: {e}"))
+
+    def _run(self):
+        while not self._stopped:
+            frame = self._read_fn()
+            if frame is None:
                 time.sleep(0.001)
                 continue
             with self._cond:
@@ -61,11 +324,10 @@ class FrameGrabber:
                 self._new = True
                 self._cond.notify_all()
 
-    def wait_new(self, timeout=1.0):
+    def wait_new(self, timeout=1.0) -> np.ndarray | None:
         with self._cond:
             if not self._new:
-                self._cond.wait(timeout=timeout)
-                if not self._new:
+                if not self._cond.wait(timeout=timeout):
                     return None
             self._new = False
             return self._frame
@@ -78,19 +340,34 @@ class FrameGrabber:
 
 
 class FramePrep:
-    def __init__(self, grabber: FrameGrabber, width: int, height: int):
+    """Zero-allocation pipeline: FP32 host scaling, FP16 cast at the GPU input boundary."""
+
+    def __init__(
+        self, grabber: FrameGrabber, width: int, height: int, error_q: queue.Queue
+    ):
         self.grabber = grabber
         self.W = width
         self.H = height
-        self.bufs = [
-            torch.empty((1, 3, height, width), dtype=torch.uint8, pin_memory=True),
-            torch.empty((1, 3, height, width), dtype=torch.uint8, pin_memory=True),
+        self.error_q = error_q
+
+        # Pinned host memory input buffers mapped directly into FP16 layout
+        self.pinned_bufs = [
+            allocate_pinned_numpy((1, 3, height, width), dtype=np.float16),
+            allocate_pinned_numpy((1, 3, height, width), dtype=np.float16),
         ]
+        self.bufs = [pb.array for pb in self.pinned_bufs]
+
+        # FP32 scratch buffer prevents CPU float16 SIMD execution bottlenecks
+        self.pinned_scratch = allocate_pinned_numpy(
+            (height, width, 3), dtype=np.float32
+        )
+        self._hwc_scratch = self.pinned_scratch.array
+
         self._cond = threading.Condition()
         self._ready_idx = None
         self._inuse_idx = None
         self._stopped = False
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run_guarded, daemon=True)
         self._thread.start()
 
     def _free_idx(self):
@@ -99,34 +376,48 @@ class FramePrep:
                 return i
         return None
 
+    def _run_guarded(self):
+        try:
+            self._run()
+        except Exception as e:
+            self.error_q.put(WorkerException(f"FramePrep failed: {e}"))
+
     def _run(self):
+        scale = np.float32(1.0 / 255.0)
         while not self._stopped:
             frame = self.grabber.wait_new(timeout=1.0)
             if frame is None:
                 continue
-            if frame.shape[1] != self.W or frame.shape[0] != self.H:
-                frame = cv2.resize(frame, (self.W, self.H))
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+            rgb = frame
+            if frame.shape[2] == 4:
+                rgb = frame[..., :3]
+            if frame.shape[0] != self.H or frame.shape[1] != self.W:
+                from PIL import Image
+
+                rgb = np.array(Image.fromarray(rgb).resize((self.W, self.H)))
+
             with self._cond:
-                fi = None
-                while not self._stopped:
-                    fi = self._free_idx()
-                    if fi is not None:
-                        break
-                    self._cond.wait(timeout=1.0)
+                fi = self._free_idx()
                 if fi is None:
-                    return
-                self.bufs[fi].copy_(t)
+                    self._cond.wait(timeout=1.0)
+                    continue
+
+                # FP32 Vectorized Scaling Operation
+                np.multiply(rgb, scale, out=self._hwc_scratch, casting="unsafe")
+
+                # Single-pass FP32 -> FP16 downcast + transpose into DMA host target buffer
+                np.copyto(self.bufs[fi][0], self._hwc_scratch.transpose(2, 0, 1))
+
                 self._ready_idx = fi
                 self._cond.notify_all()
 
-    def take(self, timeout=5.0):
+    def take(self, timeout=2.0) -> tuple[int | None, np.ndarray | None]:
         with self._cond:
             while self._ready_idx is None and not self._stopped:
                 if not self._cond.wait(timeout=timeout):
                     if self._ready_idx is None:
-                        continue
+                        return None, None
             if self._stopped or self._ready_idx is None:
                 return None, None
             idx = self._ready_idx
@@ -134,7 +425,7 @@ class FramePrep:
             self._inuse_idx = idx
             return idx, self.bufs[idx]
 
-    def release(self, idx):
+    def release(self, idx: int):
         with self._cond:
             if self._inuse_idx == idx:
                 self._inuse_idx = None
@@ -146,87 +437,314 @@ class FramePrep:
             self._cond.notify_all()
         self._thread.join(timeout=1.0)
 
-
-class CapturePipeline:
-    def __init__(self, width: int, height: int):
-        self.width = width
-        self.height = height
-        self.cap = None
-        self.grabber = None
-        self.prep = None
-
-    def start(self, input_device: str, fps: int):
-        self.cap = open_capture(input_device, self.width, self.height, fps)
-        self.grabber = FrameGrabber(self.cap)
-        self.prep = FramePrep(self.grabber, self.width, self.height)
-
-    def stop(self):
-        if self.prep is not None:
-            self.prep.stop()
-        if self.grabber is not None:
-            self.grabber.stop()
-        if self.cap is not None:
-            self.cap.release()
-        self.prep = self.grabber = self.cap = None
+    def cleanup(self):
+        self.stop()
+        for pb in self.pinned_bufs:
+            pb.cleanup()
+        self.pinned_scratch.cleanup()
 
 
-def _consumer_count(output_device: str) -> int:
-    our_pid = os.getpid()
-    count = 0
-    try:
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            pid = int(entry)
-            if pid == our_pid:
-                continue
+class RecurrentStateBufferGPU:
+    """Manages RVM r1-r4 recurrent state tensors.
+
+    Initial states are allocated at their *final* static spatial shape
+    instead of a broadcastable (1, C, 1, 1) shape.
+
+    MIGraphX compiles a fixed computation graph for the exact tensor
+    shapes seen on the first inference call. If the r*i input shape
+    changed between frame 1 (broadcast shape) and frame 2 (real spatial
+    shape fed back from r*o), MIGraphX would have to recompile the
+    entire graph from scratch on frame 2 -- which can hang for minutes
+    and blocks the main thread inside a native call, making the process
+    appear stuck and unresponsive to Ctrl-C. Keeping the shape constant
+    across every call from frame 1 onward avoids any recompilation.
+
+    Shape derivation (empirically verified against the RVM ONNX graph):
+    RVM first resizes ``src`` by ``downsample_ratio`` (ceil rounding),
+    then the encoder halves the spatial resolution (ceil rounding) once
+    per recurrent stage: r1 after 1 halving, r2 after 2, r3 after 3,
+    r4 after 4.
+    """
+
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        downsample_ratio: float = 0.25,
+        device_id: int = 0,
+    ):
+        self.device_id = device_id
+        self.channels = {"r1": 16, "r2": 20, "r3": 40, "r4": 64}
+        self.num_halvings = {"r1": 1, "r2": 2, "r3": 3, "r4": 4}
+
+        h0 = math.ceil(height * downsample_ratio)
+        w0 = math.ceil(width * downsample_ratio)
+
+        def halved(n: int) -> tuple[int, int]:
+            h, w = h0, w0
+            for _ in range(n):
+                h = math.ceil(h / 2)
+                w = math.ceil(w / 2)
+            return h, w
+
+        self._states = {
+            name: np.zeros((1, C, *halved(self.num_halvings[name])), dtype=np.float16)
+            for name, C in self.channels.items()
+        }
+
+        self.device_type = self._detect_device_type(device_id)
+
+    def _detect_device_type(self, device_id: int) -> str:
+        """Return a device identifier usable by OrtValue (``'cpu'`` fallback)."""
+        available_providers = ort.get_available_providers()
+        click.echo(f"[rvm-webcam] Available Execution Providers: {available_providers}")
+
+        required = ["MIGraphXExecutionProvider"]
+        if not any(p in available_providers for p in required):
+            raise RuntimeError(
+                f"Execution provider assertion failed. None of {required} are present "
+                f"in current ONNX Runtime build. Available providers: {available_providers}"
+            )
+
+        dummy = np.zeros((1,), dtype=np.float32)
+        for candidate in ["rocm", "cuda", "hip"]:
             try:
-                fd_dir = f"/proc/{entry}/fd"
-                for fd_entry in os.listdir(fd_dir):
-                    try:
-                        link = os.readlink(f"{fd_dir}/{fd_entry}")
-                        if link == output_device:
-                            count += 1
-                    except OSError:
-                        pass
-            except (PermissionError, FileNotFoundError):
+                handle = ort.OrtValue.ortvalue_from_numpy(dummy, candidate, device_id)
+                del handle
+                click.echo(f"[rvm-webcam] Confirmed ORT device identifier: '{candidate}'")
+                return candidate
+            except Exception:
                 pass
-    except PermissionError:
-        pass
-    return count
+
+        return "cpu"
+
+    def bind_inputs(self, io_binding: ort.IOBinding):
+        """Bind state input tensors (r1i, r2i, r3i, r4i) as CPU inputs.
+
+        Using ``bind_cpu_input`` rather than ``bind_ortvalue_input`` so
+        that ORT handles device transfer to the MIGraphX EP correctly.
+        """
+        for name in ["r1", "r2", "r3", "r4"]:
+            io_binding.bind_cpu_input(f"{name}i", self._states[name])
+
+    def store_outputs(self, ortvals: list[ort.OrtValue]):
+        """Store the four output state tensors (r1o, r2o, r3o, r4o) as the
+        next frame's inputs.  Call *after* ``run_with_iobinding``.
+
+        Data is **copied** out of the ORT-managed output buffers to prevent
+        memory corruption from internal buffer reuse on the next run.
+        """
+        for i, name in enumerate(["r1", "r2", "r3", "r4"]):
+            self._states[name] = ortvals[i].numpy().copy()
+
+
+class MIGraphXSession:
+    """ONNX Runtime session wrapper targeting ROCm / MIGraphX execution graph."""
+
+    def __init__(
+        self,
+        model_path: str,
+        height: int,
+        width: int,
+        downsample_ratio: float = 0.25,
+        device_id: int = 0,
+        cache_dir: str | None = None,
+    ):
+        ort.set_default_logger_severity(3)
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        model_bytes = self._harden_model(model_path, downsample_ratio)
+
+        if "MIGraphXExecutionProvider" not in ort.get_available_providers():
+            raise RuntimeError(
+                "MIGraphX execution provider not available. "
+                "Install onnxruntime-rocm or build with MIGraphX support."
+            )
+        providers = ["MIGraphXExecutionProvider", "CPUExecutionProvider"]
+        if cache_dir:
+            cache_path = Path(cache_dir)
+            cache_path.mkdir(parents=True, exist_ok=True)
+            providers = [
+                (
+                    "MIGraphXExecutionProvider",
+                    {
+                        "device_id": str(device_id),
+                        "migraphx_fp16_enable": "1",
+                        "migraphx_model_cache_dir": str(cache_path),
+                    },
+                ),
+                "CPUExecutionProvider",
+            ]
+
+        click.echo(f"[rvm-webcam] Instantiating acceleration engine for: {model_path}")
+        self.session = ort.InferenceSession(
+            model_bytes, so, providers=providers
+        )
+
+        # Confirm acceleration providers bound successfully
+        active_providers = self.session.get_providers()
+        click.echo(f"[rvm-webcam] Active Session Providers: {active_providers}")
+
+        self.io_binding = self.session.io_binding()
+        self._validate_model_signature(height, width)
+
+    def _validate_model_signature(self, expected_height: int, expected_width: int):
+        """Assert src input dtype and static spatial dimensions."""
+        inputs_by_name = {inp.name: inp for inp in self.session.get_inputs()}
+
+        for name, exp_type, exp_shape in [
+            ("src", "tensor(float16)", (1, 3, expected_height, expected_width)),
+        ]:
+            actual = inputs_by_name[name]
+            if actual.type != exp_type:
+                raise RuntimeError(
+                    f"ONNX graph type assertion failed for input '{name}': "
+                    f"Model expects '{actual.type}', but runtime pipeline requires '{exp_type}'."
+                )
+            for axis_idx, (exp_dim, act_dim) in enumerate(zip(exp_shape, actual.shape)):
+                if isinstance(act_dim, int) and act_dim != exp_dim:
+                    raise RuntimeError(
+                        f"ONNX graph shape mismatch for input '{name}' at axis {axis_idx}: "
+                        f"Model static shape requires {act_dim}, runtime configured for {exp_dim}."
+                    )
+            click.echo(
+                f"[rvm-webcam] Verified input signature '{name}': dtype={actual.type}, shape={actual.shape}"
+            )
+
+        outputs_by_name = {o.name: o for o in self.session.get_outputs()}
+        for name, exp_type in [("fgr_fp32", "tensor(float)"), ("pha_fp32", "tensor(float)")]:
+            actual = outputs_by_name.get(name)
+            if actual is None:
+                click.echo(
+                    f"[rvm-webcam] WARNING: expected cast output '{name}' not found "
+                    f"in model (original model without FP32 cast?)"
+                )
+                continue
+            if actual.type != exp_type:
+                raise RuntimeError(
+                    f"ONNX graph type assertion failed for output '{name}': "
+                    f"expected '{exp_type}', got '{actual.type}'"
+                )
+
+    def _harden_model(self, model_path: str, ratio: float) -> bytes:
+        """Replace the dynamic *downsample_ratio* input with a compile-time
+        constant so that MIGraphXExecutionProvider accepts the Resize(linear) node.
+
+        Returns serialized model bytes on success, or the original *model_path*
+        string (for ORT to load from disk) if the file is not found or the
+        ONNX graph doesn't have the expected structure.
+        """
+        try:
+            model = onnx.load(model_path)
+        except Exception as exc:
+            click.echo(
+                f"[rvm-webcam] WARNING: could not load model for hardening ({exc}); "
+                "loading original"
+            )
+            return model_path  # type: ignore[return-value]  # ORT accepts str path or bytes
+
+        input_names = {i.name for i in model.graph.input}
+        if "downsample_ratio" not in input_names:
+            return model.SerializeToString()
+
+        scale = np.array([1.0, 1.0, ratio, ratio], dtype=np.float32)
+
+        to_remove = []
+        insertion_point = None
+        for i, node in enumerate(model.graph.node):
+            if node.name in ("Constant_1", "Concat_2"):
+                to_remove.append(node)
+            if node.name == "Resize_3":
+                insertion_point = i
+
+        if insertion_point is None or not to_remove:
+            return model.SerializeToString()
+
+        for node in to_remove:
+            model.graph.node.remove(node)
+
+        # Adjust insertion point for removed nodes before Resize_3
+        for node in to_remove:
+            idx = None
+            for j, n in enumerate(model.graph.node):
+                if n.name == node.name:
+                    idx = j
+                    break
+            if idx is not None and idx < insertion_point:
+                insertion_point -= 1
+
+        new_constant = helper.make_node(
+            "Constant",
+            inputs=[],
+            outputs=["388"],
+            name="HardenedScale",
+            value=helper.make_tensor(
+                "hardened_scale_value",
+                TensorProto.FLOAT,
+                scale.shape,
+                scale.tobytes(),
+                raw=True,
+            ),
+        )
+
+        model.graph.node.insert(insertion_point, new_constant)
+
+        for i, inp in enumerate(model.graph.input):
+            if inp.name == "downsample_ratio":
+                del model.graph.input[i]
+                break
+
+        click.echo(f"[rvm-webcam] Hardened downsample_ratio={ratio} into model")
+
+        self._cast_model_outputs_to_fp32(model)
+
+        return model.SerializeToString()
+
+    @staticmethod
+    def _cast_model_outputs_to_fp32(model: onnx.ModelProto):
+        """Insert Cast(FP32) nodes for fgr and pha outputs so MIGraphX
+        converts FP16→FP32 on GPU; CPU composition avoids slow x86 FP16 ops."""
+        cast_targets = {"fgr", "pha"}
+        output_by_name: dict[str, onnx.ValueInfoProto] = {
+            o.name: o for o in model.graph.output
+        }
+
+        for target in cast_targets & output_by_name.keys():
+            o = output_by_name[target]
+            new_name = f"{target}_fp32"
+            cast_node = helper.make_node(
+                "Cast",
+                inputs=[target],
+                outputs=[new_name],
+                name=f"Cast_{target}_to_fp32",
+                to=TensorProto.FLOAT,
+            )
+            model.graph.node.append(cast_node)
+
+            # Deep-copy output info so symbolic dims (batch, height, width)
+            # are preserved; only change name and dtype.
+            new_output = copy.deepcopy(o)
+            new_output.name = new_name
+            new_output.type.tensor_type.elem_type = TensorProto.FLOAT
+            # Replace in-place to preserve output order
+            idx = list(model.graph.output).index(o)
+            model.graph.output.remove(o)
+            model.graph.output.insert(idx, new_output)
 
 
 DEFAULTS = {
-    "backbone": "mobilenetv3",
+    "model_path": "rvm_mobilenetv3_fp16.onnx",
     "input_device": "/dev/video0",
     "output_device": "/dev/video10",
     "width": 1280,
     "height": 720,
     "fps": 30,
     "downsample_ratio": 0.25,
-    "precision": "auto",
+    "device_id": 0,
+    "cache_dir": None,
 }
-
-
-def _draw_debug_overlay(img, fps, infer_ms, take_ms, d2h_ms):
-    text = f"{fps:.1f} fps  I:{infer_ms:.1f}  D:{d2h_ms:.1f}  C:{take_ms:.1f}ms"
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.5
-    thick = 1
-    (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
-    pad = 8
-    margin = 10
-    h, w = img.shape[:2]
-    x1 = margin
-    y1 = h - margin - th - bl - 2 * pad
-    x2 = x1 + tw + 2 * pad
-    y2 = h - margin
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
-    tx = x1 + pad
-    ty = y2 - pad - bl
-    cv2.putText(img, text, (tx, ty), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
 
 
 def _load_config():
@@ -240,137 +758,95 @@ def _load_config():
     return {}
 
 
-def _compute_bg_tensor(bg_image, bg_color, width, height, device, dtype):
-    if bg_image:
-        img = cv2.imread(bg_image)
-        if img is None:
-            raise click.BadParameter(f"Could not load image: {bg_image}", param_hint="--bg-image")
-        img = cv2.resize(img, (width, height))
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        bg_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).to(device=device, dtype=dtype) / 255.0
-        click.echo(f"[rvm-webcam] using background image: {bg_image}")
-        return bg_tensor
-
-    color_str = bg_color if bg_color else "0,255,0"
-    parts = color_str.split(",")
-    if len(parts) != 3:
-        raise click.BadParameter(f"expected 'R,G,B', got {color_str!r}", param_hint="--bg-color")
-    try:
-        r, g, b = (int(x) for x in parts)
-    except ValueError:
-        raise click.BadParameter(f"R,G,B values must be integers, got {color_str!r}", param_hint="--bg-color")
-    if not all(0 <= c <= 255 for c in (r, g, b)):
-        raise click.BadParameter(f"R,G,B values must be in 0-255, got {color_str!r}", param_hint="--bg-color")
-    click.echo(f"[rvm-webcam] using background color: {color_str}")
-    return torch.tensor([r / 255, g / 255, b / 255], device=device, dtype=dtype).view(3, 1, 1)
-
-
 @click.command()
-@click.option("--model-path", required=False, type=click.Path(exists=True), help="Path to rvm_mobilenetv3.pth (can also be set in config.json)")
-@click.option("--backbone", default=None, type=click.Choice(["mobilenetv3", "resnet50"]))
-@click.option("--input-device", default=None, help="Real webcam device")
-@click.option("--output-device", default=None, help="v4l2loopback virtual device")
-@click.option("--width", default=None, type=int)
-@click.option("--height", default=None, type=int)
-@click.option("--fps", default=None, type=int)
-@click.option("--downsample-ratio", default=None, type=float, help="Lower = faster, less edge detail")
-@click.option("--bg-color", default=None, help="R,G,B for composite background (mutually exclusive with --bg-image)")
-@click.option("--bg-image", default=None, type=click.Path(exists=True), help="Path to a background image, e.g. JPG/PNG (mutually exclusive with --bg-color)")
-@click.option("--precision", default=None, type=click.Choice(["auto", "fp16", "fp32"]))
-@click.option("--on-demand", is_flag=True, default=False, help="Only capture webcam when a consumer reads /dev/video10")
-@click.option("--debug", is_flag=True, default=False, help="Overlay performance stats on the output frame")
-def main(model_path, backbone, input_device, output_device, width, height, fps,
-         downsample_ratio, bg_color, bg_image, precision, on_demand, debug):
+@click.option("--model-path", type=click.Path(exists=True))
+@click.option("--input-device")
+@click.option("--output-device")
+@click.option("--width", type=int)
+@click.option("--height", type=int)
+@click.option("--fps", type=int)
+@click.option("--downsample-ratio", type=float)
+@click.option("--device-id", type=int)
+@click.option("--cache-dir", type=click.Path(), default=None, help="MIGraphX .mxr compile cache directory (avoids recompilation on restart)")
+def main(
+    model_path,
+    input_device,
+    output_device,
+    width,
+    height,
+    fps,
+    downsample_ratio,
+    device_id,
+    cache_dir,
+):
     cfg = _load_config()
-
-    model_path = model_path or cfg.get("model_path")
-    if model_path is None:
-        raise click.UsageError(
-            "--model-path is required. Pass it directly or create "
-            "~/.config/rvm-webcam/config.json or /etc/rvm-webcam/config.json "
-            'with {"model_path": "/path/to/model.pth"}'
-        )
-
-    backbone = backbone or cfg.get("backbone") or DEFAULTS["backbone"]
+    model_path = model_path or cfg.get("model_path") or DEFAULTS["model_path"]
     input_device = input_device or cfg.get("input_device") or DEFAULTS["input_device"]
-    output_device = output_device or cfg.get("output_device") or DEFAULTS["output_device"]
+    output_device = (
+        output_device or cfg.get("output_device") or DEFAULTS["output_device"]
+    )
     width = width or cfg.get("width") or DEFAULTS["width"]
     height = height or cfg.get("height") or DEFAULTS["height"]
     fps = fps or cfg.get("fps") or DEFAULTS["fps"]
-    downsample_ratio = downsample_ratio or cfg.get("downsample_ratio") or DEFAULTS["downsample_ratio"]
-    bg_color = bg_color or cfg.get("bg_color")
-    bg_image = bg_image or cfg.get("bg_image")
-    precision = precision or cfg.get("precision") or DEFAULTS["precision"]
-    if not on_demand:
-        on_demand = cfg.get("on_demand", False)
-    if not debug:
-        debug = cfg.get("debug", False)
-
-    if bg_color and bg_image:
-        raise click.UsageError("--bg-color and --bg-image are mutually exclusive.")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    _is_rocm = (
-        torch.cuda.is_available()
-        and hasattr(torch.version, "hip")
-        and torch.version.hip is not None
+    downsample_ratio = (
+        downsample_ratio or cfg.get("downsample_ratio") or DEFAULTS["downsample_ratio"]
     )
-    if precision == "auto":
-        dtype = torch.float16 if device == "cuda" else torch.float32
-    else:
-        dtype = torch.float16 if precision == "fp16" else torch.float32
+    device_id = device_id or cfg.get("device_id") or DEFAULTS["device_id"]
+    cache_dir = cache_dir or cfg.get("cache_dir") or DEFAULTS["cache_dir"]
 
-    _backend = "rocm" if _is_rocm else device
-    click.echo(f"[rvm-webcam] device={_backend} dtype={dtype} downsample_ratio={downsample_ratio}")
+    error_q = queue.Queue()
 
-    if not _is_rocm:
-        torch.backends.cudnn.benchmark = True
-
-    model = load_model(model_path, backbone, device)
-    model = model.to(dtype)
-
-    bg_tensor = _compute_bg_tensor(bg_image, bg_color, width, height, device, dtype)
+    # 1. Initialize Hardware Engine & Enforce Provider Assertions
+    engine = MIGraphXSession(
+        model_path,
+        height,
+        width,
+        downsample_ratio=downsample_ratio,
+        device_id=device_id,
+        cache_dir=cache_dir,
+    )
+    state_mgr = RecurrentStateBufferGPU(
+        height, width, downsample_ratio=downsample_ratio, device_id=device_id
+    )
 
     import pyvirtualcam
-    vcam = pyvirtualcam.Camera(width=width, height=height, fps=fps, device=output_device)
-    click.echo(f"[rvm-webcam] virtual camera live on {output_device}")
 
-    use_cuda = device == "cuda"
+    # 2. Instantiate DMA-Capable Pinned Host Output Buffers (FP32)
+    # Model has Cast(FP32) nodes on fgr/pha so MIGraphX converts on GPU.
+    pb_fgr = allocate_pinned_numpy((1, 3, height, width), dtype=np.float32)
+    pb_pha = allocate_pinned_numpy((1, 1, height, width), dtype=np.float32)
 
-    src_gpu = [torch.empty((1, 3, height, width), device=device, dtype=dtype) for _ in range(2)]
-    h2d_stream = torch.cuda.Stream() if use_cuda else None
-    h2d_events: list[torch.cuda.Event] = (
-        [torch.cuda.Event(), torch.cuda.Event()] if use_cuda else []
+    fgr_out = pb_fgr.array
+    pha_out = pb_pha.array
+
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg not found in PATH")
+
+    frame_size = width * height * 3
+
+    vcam = pyvirtualcam.Camera(
+        width=width, height=height, fps=fps, device=output_device
+    )
+    click.echo(
+        f"[rvm-webcam] Pipeline successfully bound to virtual camera: {output_device}"
     )
 
-    def launch_h2d(buf, dst, slot):
-        if use_cuda:
-            with torch.cuda.stream(h2d_stream):
-                dst.copy_(buf, non_blocking=True)
-                dst.div_(255.0)
-            h2d_events[slot].record(h2d_stream)
-        else:
-            dst.copy_(buf)
-            dst.div_(255.0)
-
-    pipeline = CapturePipeline(width, height)
-
-    last_poll = 0.0
-    POLL_INTERVAL = 1.0
-    black_frame = np.zeros((height, width, 3), dtype=np.uint8)
-    if on_demand:
+    # 3. Monitor the loopback CAPTURE side so the physical camera (and
+    # GPU pipeline) is only activated while a real consumer is
+    # streaming from the virtual camera -- i.e. the "shutter" only
+    # opens when something is actually watching.
+    consumer_monitor = LoopbackConsumerMonitor(output_device)
+    if consumer_monitor._supported:
         click.echo(
-            f"[rvm-webcam] on-demand enabled: webcam opens when consumer reads {output_device}"
+            "[rvm-webcam] Consumer detection active: physical camera will "
+            "only open while a consumer is attached to the virtual camera."
         )
-    else:
-        pipeline.start(input_device, fps)
 
-    rec = [None] * 4
+    bg_color = np.array([0, 255, 0], dtype=np.float32)
     running = True
 
     def shutdown(signum, frame):
         nonlocal running
-        click.echo("\n[rvm-webcam] shutting down...")
         running = False
 
     signal.signal(signal.SIGINT, shutdown)
@@ -378,150 +854,215 @@ def main(model_path, backbone, input_device, output_device, width, height, fps,
 
     frame_count = 0
     t_start = time.perf_counter_ns()
-    acc_h2d = 0
-    acc_infer = 0
-    acc_take = 0
-    acc_d2h = 0
-    acc_sleep = 0
-    cur = 0
-    prev_buf_idx = None
 
-    def _emit(out_gpu):
-        out = out_gpu.cpu().numpy()
-        if debug:
-            _draw_debug_overlay(out, ema_fps, ema_infer, ema_take, ema_d2h)
-        vcam.send(out)
+    # Physical-camera capture pipeline state; only non-None while a
+    # consumer is attached ("shutter open").
+    ffmpeg_proc = None
+    grabber = None
+    prep = None
 
-    prev_frame_ts = 0
-    ema_fps = 0.0
-    ema_infer = 0.0
-    ema_take = 0.0
-    ema_d2h = 0.0
+    def open_shutter():
+        nonlocal ffmpeg_proc, grabber, prep
+        subprocess.run(
+            [
+                "v4l2-ctl",
+                "-d",
+                input_device,
+                "--set-fmt-video",
+                f"width={width},height={height},pixelformat=MJPG",
+            ],
+            capture_output=True,
+            timeout=5.0,
+        )
+
+        ffmpeg_proc = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
+                "-f",
+                "v4l2",
+                "-input_format",
+                "mjpeg",
+                "-video_size",
+                f"{width}x{height}",
+                "-framerate",
+                str(fps),
+                "-i",
+                input_device,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{width}x{height}",
+                "-an",
+                "-sn",
+                "-dn",
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        proc = ffmpeg_proc
+
+        def read_frame():
+            raw = proc.stdout.read(frame_size)
+            if not raw or len(raw) < frame_size:
+                return None
+            return np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+
+        grabber = FrameGrabber(read_frame, error_q)
+        prep = FramePrep(grabber, width, height, error_q)
+        click.echo(f"[rvm-webcam] Shutter open: capturing from {input_device}")
+
+    def close_shutter():
+        nonlocal ffmpeg_proc, grabber, prep
+        if prep is not None:
+            prep.cleanup()
+            prep = None
+        if grabber is not None:
+            grabber.stop()
+            grabber = None
+        if ffmpeg_proc is not None:
+            ffmpeg_proc.terminate()
+            try:
+                ffmpeg_proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                ffmpeg_proc.kill()
+                ffmpeg_proc.wait(timeout=2.0)
+            ffmpeg_proc = None
+            click.echo(f"[rvm-webcam] Shutter closed: released {input_device}")
+
+    # Idle frame sent while no consumer is attached. The virtual
+    # camera's OUTPUT side must keep streaming *something* at all
+    # times: v4l2loopback's VIDIOC_STREAMON on the CAPTURE side fails
+    # with -EIO if the OUTPUT side has never streamed, so gating
+    # `vcam.send()` itself behind consumer detection creates a
+    # chicken-and-egg deadlock -- the consumer can never connect
+    # because the producer waits for the consumer, and the producer
+    # never starts because no consumer has connected yet. Only the
+    # physical camera capture + GPU inference are gated; the virtual
+    # camera output always stays live.
+    idle_frame = np.tile(bg_color.astype(np.uint8), (height, width, 1))
 
     try:
-        with torch.no_grad():
-            while running:
-                if on_demand:
-                    now = time.monotonic()
-                    if now - last_poll >= POLL_INTERVAL:
-                        last_poll = now
-                        consumers = _consumer_count(output_device)
+        while running:
+            if not error_q.empty():
+                raise error_q.get()
 
-                        if consumers > 0:
-                            if pipeline.cap is None:
-                                click.echo(
-                                    f"[rvm-webcam] {consumers} consumer(s) connected, opening webcam",
-                                    err=True,
-                                )
-                                try:
-                                    pipeline.start(input_device, fps)
-                                except RuntimeError as e:
-                                    click.echo(f"[rvm-webcam] {e}, retrying...", err=True)
-                                    pipeline.stop()
-                                    continue
-                                rec = [None] * 4
-                                frame_count = 0
-                                t_start = time.perf_counter_ns()
-                                acc_h2d = acc_infer = acc_take = acc_d2h = acc_sleep = 0
-                                cur = 0
-                                prev_buf_idx = None
-                        else:
-                            if pipeline.cap is not None:
-                                click.echo(
-                                    "[rvm-webcam] no consumers, releasing webcam",
-                                    err=True,
-                                )
-                                pipeline.stop()
-                                rec = [None] * 4
-
-                    if pipeline.cap is None:
-                        vcam.send(black_frame)
-                        vcam.sleep_until_next_frame()
-                        continue
-
-                prep = pipeline.prep
-                assert prep is not None
-
-                if prev_buf_idx is None:
-                    if debug:
-                        prev_frame_ts = 0
-                    idx, buf = prep.take(timeout=5.0)
-                    if buf is None:
-                        continue
-                    launch_h2d(buf, src_gpu[cur], cur)
-                    prev_buf_idx = idx
-                    continue
-
-                t0 = time.perf_counter_ns()
-                if use_cuda:
-                    h2d_events[cur].wait()
-                prep.release(prev_buf_idx)
-                t1 = time.perf_counter_ns()
-                acc_h2d += t1 - t0
-
-                fgr, pha, *rec = model(src_gpu[cur], *rec, downsample_ratio)
-                t2 = time.perf_counter_ns()
-                acc_infer += t2 - t1
-
-                com = fgr * pha + bg_tensor * (1 - pha)
-                out_gpu = (com[0].permute(1, 2, 0).clamp(0, 1) * 255).byte()
-
-                nxt = 1 - cur
-                idx, buf = prep.take(timeout=5.0)
-                t3 = time.perf_counter_ns()
-                acc_take += t3 - t2
-                if buf is None:
-                    _emit(out_gpu)
-                    break
-                launch_h2d(buf, src_gpu[nxt], nxt)
-
-                _emit(out_gpu)
-
-                frame_count += 1
-                prev_buf_idx = idx
-                cur = nxt
-
-                t4 = time.perf_counter_ns()
+            if not consumer_monitor.is_active:
+                if prep is not None:
+                    close_shutter()
+                vcam.send(idle_frame)
                 vcam.sleep_until_next_frame()
-                t5 = time.perf_counter_ns()
-                acc_sleep += t5 - t4
-                acc_d2h += t4 - t3
+                continue
 
-                if debug:
-                    inst_interval = (t0 - prev_frame_ts) / 1e9 if prev_frame_ts > 0 else 0
-                    inst_fps = 1.0 / inst_interval if inst_interval > 0 else 0
-                    inst_infer = (t2 - t1) / 1e6
-                    inst_take = (t3 - t2) / 1e6
-                    inst_d2h = (t4 - t3) / 1e6
-                    a = 0.1
-                    if prev_frame_ts == 0:
-                        ema_fps = inst_fps
-                        ema_infer = inst_infer
-                        ema_take = inst_take
-                        ema_d2h = inst_d2h
-                    else:
-                        ema_fps = a * inst_fps + (1 - a) * ema_fps
-                        ema_infer = a * inst_infer + (1 - a) * ema_infer
-                        ema_take = a * inst_take + (1 - a) * ema_take
-                        ema_d2h = a * inst_d2h + (1 - a) * ema_d2h
-                    prev_frame_ts = t0
+            if prep is None:
+                open_shutter()
 
-                if frame_count % 100 == 0 and frame_count > 0:
-                    n = frame_count
-                    ms = lambda ns: ns / 1e6
-                    click.echo(
-                        f"[rvm-webcam] {frame_count / ((t5 - t_start) / 1e9):.1f} fps  "
-                        f"h2d={ms(acc_h2d/n):.1f}  "
-                        f"infer={ms(acc_infer/n):.1f}  "
-                        f"take={ms(acc_take/n):.1f}  "
-                        f"d2h+send={ms(acc_d2h/n):.1f}  "
-                        f"sleep={ms(acc_sleep/n):.1f}",
-                        err=True,
-                    )
+            idx, src_buf = prep.take(timeout=1.0)  # type: ignore[union-attr]
+            if src_buf is None:
+                continue
+            assert idx is not None
+
+            t0 = time.perf_counter_ns()
+
+            try:
+                io = engine.io_binding
+                io.clear_binding_inputs()
+                io.clear_binding_outputs()
+
+                io.bind_cpu_input("src", src_buf)
+                state_mgr.bind_inputs(io)
+
+                io.bind_output(
+                    "fgr_fp32",
+                    "cpu",
+                    0,
+                    np.float32,
+                    fgr_out.shape,
+                    fgr_out.ctypes.data,
+                )
+                io.bind_output(
+                    "pha_fp32",
+                    "cpu",
+                    0,
+                    np.float32,
+                    pha_out.shape,
+                    pha_out.ctypes.data,
+                )
+
+                io.bind_output("r1o")
+                io.bind_output("r2o")
+                io.bind_output("r3o")
+                io.bind_output("r4o")
+
+                t1 = time.perf_counter_ns()
+
+                engine.session.run_with_iobinding(io)
+                io.synchronize_outputs()
+
+                t2 = time.perf_counter_ns()
+
+                all_out = io.get_outputs()
+                state_outputs = [all_out[2], all_out[3], all_out[4], all_out[5]]
+                state_mgr.store_outputs(state_outputs)
+
+            finally:
+                prep.release(idx)
+
+            pha_sq = pha_out[0, 0, ..., None]
+            fgr_sq = fgr_out[0].transpose(1, 2, 0) * 255.0
+
+            com = (fgr_sq * pha_sq + bg_color * (1.0 - pha_sq)).clip(0, 255).astype(np.uint8)
+
+            vcam.send(com)
+
+            t3 = time.perf_counter_ns()
+
+            frame_dur = (t3 - t0) / 1e9
+            target = 1.0 / fps
+            if frame_dur < target:
+                time.sleep(target - frame_dur)
+            t4 = time.perf_counter_ns()
+
+            frame_count += 1
+
+            if frame_count % 100 == 0:
+                elapsed_s = (t4 - t_start) / 1e9
+                fps_val = frame_count / elapsed_s
+                bind_ms = (t1 - t0) / 1e6
+                gpu_ms = (t2 - t1) / 1e6
+                post_ms = (t3 - t2) / 1e6
+                pacing_ms = (t4 - t3) / 1e6
+
+                click.echo(
+                    f"[rvm-webcam] {fps_val:.1f} FPS | "
+                    f"Bind: {bind_ms:.2f}ms | GPU: {gpu_ms:.2f}ms | "
+                    f"Post: {post_ms:.2f}ms | Pacing: {pacing_ms:.2f}ms",
+                    err=True,
+                )
+
     finally:
-        pipeline.stop()
+        click.echo("[rvm-webcam] Initiating hardware pipeline teardown...")
+        running = False
+        close_shutter()
+        consumer_monitor.stop()
         vcam.close()
-        click.echo("[rvm-webcam] released camera and virtual device, exiting.")
+
+        pb_fgr.cleanup()
+        pb_pha.cleanup()
+
+        click.echo(
+            "[rvm-webcam] All hardware handles, pinned pages, and streams successfully released."
+        )
 
 
 if __name__ == "__main__":
