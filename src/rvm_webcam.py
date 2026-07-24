@@ -649,36 +649,55 @@ class MIGraphXSession:
         if "downsample_ratio" not in input_names:
             return model.SerializeToString()
 
-        scale = np.array([1.0, 1.0, ratio, ratio], dtype=np.float32)
-
-        to_remove = []
-        insertion_point = None
+        # Dynamically locate the node that consumes *downsample_ratio*.
+        # In RVM's ONNX export the topology is:
+        #
+        #   Constant_N → <intermediate> ─┐
+        #                                 ├─ Concat_M → <output> → Resize_K
+        #   downsample_ratio ─────────────┘
+        #
+        # We replace Concat_M in-place with a Constant that produces
+        # <output> directly, so downstream consumers (Resize) are
+        # unaffected.  Node names like "Constant_1" / "Concat_2" differ
+        # between model variants (MobileNet vs ResNet50), so we match by
+        # data flow instead of hardcoding names.
+        concat_idx = None
         for i, node in enumerate(model.graph.node):
-            if node.name in ("Constant_1", "Concat_2"):
-                to_remove.append(node)
-            if node.name == "Resize_3":
-                insertion_point = i
+            if "downsample_ratio" in node.input:
+                concat_idx = i
+                break
 
-        if insertion_point is None or not to_remove:
+        if concat_idx is None:
             return model.SerializeToString()
 
-        for node in to_remove:
-            model.graph.node.remove(node)
+        concat_node = model.graph.node[concat_idx]
+        concat_output = concat_node.output[0]
+        concat_inputs = set(concat_node.input)
 
-        # Adjust insertion point for removed nodes before Resize_3
-        for node in to_remove:
-            idx = None
-            for j, n in enumerate(model.graph.node):
-                if n.name == node.name:
-                    idx = j
-                    break
-            if idx is not None and idx < insertion_point:
-                insertion_point -= 1
+        # Find upstream Constant nodes whose outputs feed *only* into
+        # this Concat — they become orphaned once the Concat is replaced.
+        orphan_indices = []
+        for i, node in enumerate(model.graph.node):
+            if i == concat_idx:
+                continue
+            shared = set(node.output) & concat_inputs
+            if not shared:
+                continue
+            other_consumers = 0
+            for j, other in enumerate(model.graph.node):
+                if j == i or j == concat_idx:
+                    continue
+                if shared & set(other.input):
+                    other_consumers += 1
+            if other_consumers == 0:
+                orphan_indices.append(i)
+
+        scale = np.array([1.0, 1.0, ratio, ratio], dtype=np.float32)
 
         new_constant = helper.make_node(
             "Constant",
             inputs=[],
-            outputs=["388"],
+            outputs=[concat_output],
             name="HardenedScale",
             value=helper.make_tensor(
                 "hardened_scale_value",
@@ -689,7 +708,16 @@ class MIGraphXSession:
             ),
         )
 
-        model.graph.node.insert(insertion_point, new_constant)
+        # Remove orphaned Constants (reverse order to keep indices
+        # valid), adjusting concat_idx if any orphans sat before it.
+        for idx in sorted(orphan_indices, reverse=True):
+            del model.graph.node[idx]
+            if idx < concat_idx:
+                concat_idx -= 1
+
+        # Replace the Concat in-place.
+        model.graph.node.remove(model.graph.node[concat_idx])
+        model.graph.node.insert(concat_idx, new_constant)
 
         for i, inp in enumerate(model.graph.input):
             if inp.name == "downsample_ratio":

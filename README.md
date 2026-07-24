@@ -97,7 +97,6 @@ Verifies `/dev/video*` permissions, `v4l2loopback` module, ROCm driver (`/dev/kf
 | `src/rvm_webcam.py` | Pipeline: HIP-pinned buffers, `FrameGrabber`/`FramePrep` threads, `MIGraphXSession`, `RecurrentStateBufferGPU`, `LoopbackConsumerMonitor`, compositor, CLI entry point |
 | `src/test_pipeline.py` | Pytest suite (mostly no hardware required; two tests exercise a real v4l2loopback device and skip if unavailable) |
 | `src/check_environment.py` | Dependency verification CLI |
-| `src/harden_model.py` | Standalone `harden_downsample_ratio()` utility (same technique as `MIGraphXSession._harden_model`, kept separately for ad-hoc model inspection/patching; not imported by the pipeline) |
 | `scripts/patch_onnx_resize.py` | Standalone script to patch RVM ONNX models for MIGraphX compatibility (Resize `linear`→`nearest`, explicit `AveragePool` `count_include_pad`) |
 | `flake.nix` | Nix flake: dev shell, packages, NixOS/Home Manager modules |
 
